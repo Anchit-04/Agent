@@ -1,3 +1,8 @@
 .env
 __pycache__/
 *.pyc
+
+# Go build artifacts — compiled per-platform, never source, never committed.
+*.exe
+*.exe~
+core/sandboxd/sandboxd

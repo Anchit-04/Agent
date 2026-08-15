@@ -19,16 +19,22 @@ provider's API key (set it in .env).
 
 import sys
 import json
-import subprocess
 
 from file_tools import FILE_TOOLS, FILE_TOOL_HANDLERS
 from todo_tool import TODO_TOOLS, TODO_TOOL_HANDLERS, render_todos, reset_todos
 from permissions import needs_confirmation, confirm
 from context import MAX_ITERATIONS, COMPACT_EVERY, build_compact_input
 from providers import get_provider, Turn, ToolResult
+from sandbox_client import run_bash_command
 
 MODEL_KEY = "gemini-flash"          # default entry in providers/config.py's MODEL_REGISTRY
-WORKDIR = "."                        # change this to sandbox the agent to a project folder
+
+# NOTE: the working directory the agent is sandboxed to is currently set in
+# three separate places — here's not one of them anymore (bash execution
+# moved to sandbox_client.py's own WORKDIR); file_tools.py has its own too.
+# Real fix is centralizing this into one shared config module — tracked as
+# a follow-up, not done in this change to keep it scoped to "wire up
+# sandboxd," but worth knowing before you go looking for "the" WORKDIR.
 
 SYSTEM_PROMPT = """You are a coding agent. You have access to:
 - read_file, write_file, edit_file, search_files — dedicated tools for inspecting
@@ -84,26 +90,12 @@ ALL_TOOLS = [BASH_TOOL] + FILE_TOOLS + TODO_TOOLS
 
 
 # --- Tool execution ---------------------------------------------------------
-
-def run_bash_command(command: str, timeout: int = 30) -> str:
-    """Execute a shell command and return a bounded, agent-readable result."""
-    try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            cwd=WORKDIR,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        output = result.stdout + result.stderr
-        MAX_CHARS = 8000
-        if len(output) > MAX_CHARS:
-            output = output[:MAX_CHARS] + f"\n... [truncated, {len(output)} chars total]"
-        return json.dumps({"exit_code": result.returncode, "output": output})
-    except subprocess.TimeoutExpired:
-        return json.dumps({"exit_code": -1, "output": f"Command timed out after {timeout}s"})
-
+# run_bash_command is imported from sandbox_client — it no longer calls
+# subprocess directly. See sandbox_client.py / core/sandboxd/main.go for why:
+# real OS-level containment (memory cap + guaranteed whole-tree kill on
+# timeout via a Windows Job Object) needed a separate process, not more
+# Python. Same name, same signature, same {"exit_code", "output"} return
+# shape as the old implementation — execute_tool() below didn't need to change.
 
 def execute_tool(name: str, args: dict) -> str:
     if name == "run_bash_command":
