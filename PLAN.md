@@ -37,7 +37,7 @@ lands.
 
 ## The 7 phases
 
-### 1. ✅ Sandboxing — merged (PR #1, `68df41e`)
+### 1. ✅ Sandboxing — merged (PR #1, `68df41e`; hardened further in PR #2, `3de6705`)
 Real OS-level containment for tool execution, so the agent can't touch
 anything outside the project or run away with resources.
 - `core/file_tools.py` — `_resolve()` enforces WORKDIR containment (blocks
@@ -62,6 +62,16 @@ anything outside the project or run away with resources.
   2 robustness gaps), Claude pushed fix commits to the same branch, and it
   merged into `main` as a regular merge (`68df41e`) preserving the atomic
   commit history.
+- PR #2: two more bugs surfaced by actually running the merged agent live
+  against the real Gemini API — `core/paths.py` now centralizes `WORKDIR`
+  so it's the repo root regardless of which directory `agent.py` is
+  launched from (previously relative to invocation cwd, so running from
+  `core/` silently broke every file path); `list_directory` added to
+  `SAFE_TOOLS` and `confirm()` now fails safe on `EOFError` instead of
+  crashing when there's no interactive stdin to ask on. Filed and fixed by
+  Claude as verification follow-up, same self-review/self-merge pattern as
+  PR #1 (still can't post a formal GitHub "approved" review — shared
+  account, self-approval blocked).
 
 ### 2. ✅ Provider abstraction (multi-model support)
 `core/providers/` — neutral `Turn`/`ToolCall`/`ToolResult` types
