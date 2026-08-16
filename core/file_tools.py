@@ -18,7 +18,9 @@ import re
 import json
 from pathlib import Path
 
-WORKDIR = "."  # kept in sync with agent_gemini.py / agent.py — same sandbox root
+from paths import PROJECT_ROOT
+
+WORKDIR = PROJECT_ROOT  # single source of truth — see paths.py
 
 # Directories we never want to walk into during search_files — noisy and
 # almost never what the agent actually wants to see.

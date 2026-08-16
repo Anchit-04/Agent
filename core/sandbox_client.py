@@ -26,7 +26,9 @@ import subprocess
 import threading
 from pathlib import Path
 
-WORKDIR = "."  # commands run with this as their working directory
+from paths import PROJECT_ROOT
+
+WORKDIR = PROJECT_ROOT  # commands run with this as their working directory — see paths.py
 MAX_OUTPUT_CHARS = 8000  # cap what goes back to the model — sandboxd itself
                           # doesn't truncate, that's a context-budget concern,
                           # not a sandboxing one, so it lives here instead.
