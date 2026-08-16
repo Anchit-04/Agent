@@ -1,6 +1,6 @@
  
 # Tools that always execute without asking.
-SAFE_TOOLS = {"read_file", "search_files", "todo_write"}
+SAFE_TOOLS = {"read_file", "search_files", "todo_write", "list_directory"}
  
 # Tools that require confirmation unless explicitly allowed below.
 CONFIRM_TOOLS = {"write_file", "edit_file", "run_bash_command"}
@@ -57,8 +57,17 @@ def confirm(tool_name: str, args: dict) -> bool:
     prefix list each time).
     """
     print(f"\n\033[91m[confirm]\033[0m Claude wants to {_describe(tool_name, args)}")
-    answer = input("Allow? [y]es / [n]o / [a]lways for this tool: ").strip().lower()
- 
+    try:
+        answer = input("Allow? [y]es / [n]o / [a]lways for this tool: ").strip().lower()
+    except EOFError:
+        # No interactive stdin to ask on (background process, CI, anything
+        # without a real TTY) — input() raises immediately rather than
+        # blocking. Fail safe: deny, don't crash. run_agent() already turns
+        # a denial into a normal "user denied" tool-result the model can
+        # react to, so this reuses that path for free.
+        print("\033[91mNo interactive input available — denying by default.\033[0m")
+        return False
+
     if answer == "a":
         _session_approved.add(tool_name)
         return True
