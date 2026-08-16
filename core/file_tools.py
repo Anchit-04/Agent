@@ -25,8 +25,34 @@ WORKDIR = "."  # kept in sync with agent_gemini.py / agent.py — same sandbox r
 SEARCH_IGNORE_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}
 
 
+class PathTraversalError(Exception):
+    """Raised when a requested path resolves outside the WORKDIR sandbox."""
+
+
 def _resolve(path: str) -> Path:
-    return Path(WORKDIR) / path
+    """
+    Resolve `path` relative to WORKDIR and verify the result actually stays
+    inside WORKDIR.
+
+    Plain `Path(WORKDIR) / path` (the old implementation) trusted the input:
+    a '..'-laden path walks out of the sandbox, and — more sharply — joining
+    with an *absolute* path doesn't append it, it replaces the base entirely
+    (Path(".") / "C:\\Windows" == "C:\\Windows"). Either way the model
+    ends up able to read/write anywhere the OS user can, not just the
+    project folder. We resolve to an absolute path first and then check
+    containment, which catches both cases (and symlinks that point out)
+    the same way.
+    """
+    root = Path(WORKDIR).resolve()
+    candidate = (root / path).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        raise PathTraversalError(
+            f"Path '{path}' resolves outside the sandboxed working directory "
+            f"({root}). Refusing to access it."
+        )
+    return candidate
 
 
 # --- read_file ---------------------------------------------------------------
@@ -40,6 +66,8 @@ def read_file(path: str, offset: int = None, limit: int = None) -> str:
         return json.dumps({"error": f"File not found: {path}"})
     except IsADirectoryError:
         return json.dumps({"error": f"{path} is a directory, not a file"})
+    except PathTraversalError as e:
+        return json.dumps({"error": str(e)})
 
     total = len(lines)
     start = (offset or 1) - 1
@@ -59,6 +87,8 @@ def write_file(path: str, content: str) -> str:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         return json.dumps({"success": True, "path": path, "bytes_written": len(content.encode("utf-8"))})
+    except PathTraversalError as e:
+        return json.dumps({"error": str(e)})
     except OSError as e:
         return json.dumps({"error": str(e)})
 
@@ -106,6 +136,8 @@ def edit_file(path: str, old_str: str, new_str: str) -> str:
         content = p.read_text(encoding="utf-8")
     except FileNotFoundError:
         return json.dumps({"error": f"File not found: {path}"})
+    except PathTraversalError as e:
+        return json.dumps({"error": str(e)})
 
     # --- Tier 1: exact match ---
     exact_count = content.count(old_str)
@@ -165,7 +197,10 @@ def list_directory(path: str = ".", max_depth: int = 2) -> str:
     Cross-platform by construction — this is what run_bash_command's ls/dir/
     find inconsistency across OSes was standing in for.
     """
-    root = _resolve(path)
+    try:
+        root = _resolve(path)
+    except PathTraversalError as e:
+        return json.dumps({"error": str(e)})
     if not root.exists():
         return json.dumps({"error": f"Path not found: {path}"})
     if not root.is_dir():
@@ -193,7 +228,10 @@ def list_directory(path: str = ".", max_depth: int = 2) -> str:
 
 def search_files(pattern: str, path: str = ".") -> str:
     """Regex search across text files under `path`, grep-style, cross-platform."""
-    root = _resolve(path)
+    try:
+        root = _resolve(path)
+    except PathTraversalError as e:
+        return json.dumps({"error": str(e)})
     try:
         regex = re.compile(pattern)
     except re.error as e:
