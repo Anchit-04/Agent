@@ -38,10 +38,27 @@ class OpenAICompatibleProvider(Provider):
         response = self._create_with_retry(model=self.model_id, messages=messages, tools=oai_tools)
 
         choice = response.choices[0].message
-        tool_calls = [
-            ToolCall(id=tc.id, name=tc.function.name, args=json.loads(tc.function.arguments or "{}"))
-            for tc in (choice.tool_calls or [])
-        ]
+        tool_calls = []
+        for tc in (choice.tool_calls or []):
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError as e:
+                # Cheaper/smaller models routed through this adapter (DeepSeek,
+                # Kimi) can return truncated or otherwise malformed JSON here,
+                # especially near max_tokens — a real, expected occurrence,
+                # not just theoretical. We still owe the model a ToolResult
+                # for every ToolCall.id it emitted (dropping this entry would
+                # desync the conversation), so hand back an empty-args call
+                # flagged via `raw` — agent.py checks for this before actually
+                # invoking the tool, and turns it into a normal tool-error
+                # result the model sees and can retry, instead of this
+                # exception propagating uncaught and killing the whole session.
+                tool_calls.append(ToolCall(
+                    id=tc.id, name=tc.function.name, args={},
+                    raw={"args_parse_error": str(e), "raw_arguments": tc.function.arguments},
+                ))
+                continue
+            tool_calls.append(ToolCall(id=tc.id, name=tc.function.name, args=args))
         return ProviderResponse(text=choice.content, tool_calls=tool_calls)
 
     def _create_with_retry(self, **kwargs):

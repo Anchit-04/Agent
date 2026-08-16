@@ -151,7 +151,18 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY) -> No
             if verbose and tc.name == "run_bash_command":
                 print(f"\033[93m$ {args.get('command', '')}\033[0m")
 
-            if needs_confirmation(tc.name, args):
+            if tc.raw and tc.raw.get("args_parse_error"):
+                # Provider adapter couldn't parse this call's arguments as
+                # JSON (see openai_compatible.py) — don't attempt to execute
+                # it with empty/wrong args, just hand the model back a
+                # normal tool-error result it can react to.
+                raw_args = tc.raw.get("raw_arguments", "")
+                result = json.dumps({
+                    "error": f"Could not parse arguments for {tc.name}: {tc.raw['args_parse_error']}. "
+                             f"Raw arguments received: {raw_args[:300]!r}. "
+                             "Retry the call with valid JSON arguments."
+                })
+            elif needs_confirmation(tc.name, args):
                 if confirm(tc.name, args):
                     result = execute_tool(tc.name, args)
                 else:
