@@ -1,8 +1,8 @@
 // sandboxd is a long-lived local process that runs shell commands on behalf
-// of the Python agent. This first version proves the plumbing only — it
-// reads one JSON request per line from stdin, runs it, writes one JSON
-// response per line back to stdout. No resource limits yet (that's the
-// Job Object work, layered on top of this once the pipe itself is solid).
+// of the Python agent. It reads one JSON request per line from stdin, runs
+// it inside a Windows Job Object (hard memory ceiling + guaranteed
+// whole-process-tree kill on timeout), and writes one JSON response per
+// line back to stdout.
 package main
 
 import (
@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -29,6 +30,48 @@ type Request struct {
 type Response struct {
 	ExitCode int    `json:"exit_code"`
 	Output   string `json:"output"`
+}
+
+// MaxCapturedOutputBytes bounds how much of a command's stdout/stderr
+// sandboxd will hold onto. The Job Object's memory limit only covers the
+// *child* process (it's assigned the child's PID, see AssignProcessToJobObject
+// below) — it does nothing to cap growth in sandboxd's own memory. Without
+// this, a command that just prints a lot (well within the timeout, so the
+// Job Object never fires) could grow sandboxd's own heap unboundedly, and
+// sandboxd is long-lived and shared across the whole agent session, so that
+// would take down every command still to come, not just this one. Generous
+// on purpose — this is a memory-safety backstop, not the context-budget
+// truncation sandbox_client.py already does on the Python side at 8000 chars.
+const MaxCapturedOutputBytes = 2 * 1024 * 1024 // 2MB
+
+// limitedWriter caps how many bytes it will buffer, silently discarding
+// anything past the limit instead of growing forever.
+type limitedWriter struct {
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (w *limitedWriter) Write(p []byte) (int, error) {
+	remaining := w.limit - w.buf.Len()
+	if remaining <= 0 {
+		w.truncated = true
+		return len(p), nil // report success — the command shouldn't see a write error just because we stopped keeping its output
+	}
+	if len(p) > remaining {
+		w.buf.Write(p[:remaining])
+		w.truncated = true
+		return len(p), nil
+	}
+	return w.buf.Write(p)
+}
+
+func (w *limitedWriter) String() string {
+	s := w.buf.String()
+	if w.truncated {
+		s += fmt.Sprintf("\n... [output truncated at sandboxd's %dMB buffer cap]", MaxCapturedOutputBytes/(1024*1024))
+	}
+	return s
 }
 
 func main() {
@@ -65,11 +108,18 @@ const (
 // Job Object: a hard memory ceiling and a guaranteed kill of the entire
 // process tree (including any children the command spawns) on timeout.
 func runContained(command string, timeout time.Duration, memoryLimitMB int64) Response {
-	cmd := exec.Command("cmd", "/C", command)
+	// Built via exec.Command("cmd", "/C", command) originally, but Go escapes
+	// each Args element assuming MSVCRT-style argv parsing on the far end —
+	// any `"` in command comes out as a literal `\"`, which cmd.exe does NOT
+	// unescape the same way. That silently corrupted every quoted command
+	// (git commit -m "...", python -c "...", etc). Setting SysProcAttr.CmdLine
+	// directly bypasses Go's escaping and hands cmd.exe the raw line we mean.
+	cmd := exec.Command("cmd")
+	cmd.SysProcAttr = &syscall.SysProcAttr{CmdLine: `/C ` + command}
 
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
+	buf := &limitedWriter{limit: MaxCapturedOutputBytes}
+	cmd.Stdout = buf
+	cmd.Stderr = buf
 
 	if err := cmd.Start(); err != nil {
 		return Response{ExitCode: -1, Output: fmt.Sprintf("failed to start command: %v", err)}
