@@ -74,3 +74,26 @@ class Provider(ABC):
     def generate(self, history: list[Turn], tools: list[dict], system_prompt: str) -> ProviderResponse:
         """Send the full history + provider-agnostic tool schemas, get the model's next turn back."""
         ...
+
+    def validate(self) -> bool:
+        """
+        Confirm this provider's API key actually authenticates, via the
+        cheapest real call every SDK wired up here happens to support:
+        listing available models. No completion request, no token spend —
+        just confirms the key is real and not revoked/wrong-scoped, which
+        "is the env var non-empty" (core/vault.py's presence check) can't
+        tell you. Not an abstractmethod: every adapter's self._client
+        (anthropic.Anthropic / genai.Client / openai.OpenAI) exposes
+        .models.list() identically, so one implementation covers all three
+        without touching them — override in a subclass if a future
+        provider's SDK doesn't share that shape.
+
+        Returns False rather than raising on any failure — this method's
+        only job is answering "does this key work right now", not
+        surfacing why; core/vault.py decides what to do with the result.
+        """
+        try:
+            self._client.models.list()
+            return True
+        except Exception:
+            return False
