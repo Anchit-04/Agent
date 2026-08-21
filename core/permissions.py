@@ -1,6 +1,6 @@
  
 # Tools that always execute without asking.
-SAFE_TOOLS = {"read_file", "search_files", "todo_write", "list_directory"}
+SAFE_TOOLS = {"read_file", "search_files", "todo_write", "list_directory", "memory_write", "memory_read"}
  
 # Tools that require confirmation unless explicitly allowed below.
 CONFIRM_TOOLS = {"write_file", "edit_file", "run_bash_command"}

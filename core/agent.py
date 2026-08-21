@@ -26,6 +26,7 @@ from permissions import needs_confirmation, confirm
 from context import MAX_ITERATIONS, COMPACT_EVERY, build_compact_input
 from providers import get_provider, Turn, ToolResult
 from sandbox_client import run_bash_command
+import memory
 
 MODEL_KEY = "gemini-flash"          # default entry in providers/config.py's MODEL_REGISTRY
 
@@ -86,30 +87,28 @@ BASH_TOOL = {
     },
 }
 
-ALL_TOOLS = [BASH_TOOL] + FILE_TOOLS + TODO_TOOLS
+ALL_TOOLS = [BASH_TOOL] + FILE_TOOLS + TODO_TOOLS + memory.MEMORY_TOOLS
 
 
 # --- Tool execution ---------------------------------------------------------
-# run_bash_command is imported from sandbox_client — it no longer calls
-# subprocess directly. See sandbox_client.py / core/sandboxd/main.go for why:
-# real OS-level containment (memory cap + guaranteed whole-tree kill on
-# timeout via a Windows Job Object) needed a separate process, not more
-# Python. Same name, same signature, same {"exit_code", "output"} return
-# shape as the old implementation — execute_tool() below didn't need to change.
 
-def execute_tool(name: str, args: dict) -> str:
+def execute_tool(name: str, args: dict, model_key: str) -> str:
     if name == "run_bash_command":
         return run_bash_command(args["command"])
     if name in FILE_TOOL_HANDLERS:
         return FILE_TOOL_HANDLERS[name](args)
     if name in TODO_TOOL_HANDLERS:
         return TODO_TOOL_HANDLERS[name](args)
+    if name in memory.MEMORY_TOOL_HANDLERS:
+        return memory.MEMORY_TOOL_HANDLERS[name](model_key, args)
     return json.dumps({"error": f"Unknown tool: {name}"})
 
 
 # --- The agent loop ---------------------------------------------------------
 
-def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY) -> None:
+def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, interactive: bool = True) -> str:
+    """interactive=False skips the confirm() gate — used when running as a
+    concurrent executor (Phase 5), since input() across threads is broken."""
     provider = get_provider(model_key)
     reset_todos()  # fresh plan state per task, not carried over from a prior run
 
@@ -118,23 +117,27 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY) -> No
     history = [Turn(role="user", text=task)]
 
     turn_count = 0
+    final_text = ""
     while True:
         response = provider.generate(history, ALL_TOOLS, SYSTEM_PROMPT)
 
-        if response.text and verbose:
-            print(f"\n\033[94m{model_key}:\033[0m {response.text}")
+        if response.text:
+            final_text = response.text
+            if verbose:
+                print(f"\n\033[94m{model_key}:\033[0m {response.text}")
 
         if not response.tool_calls:
             break  # model is done: no more tools requested
 
         turn_count += 1
         if turn_count >= MAX_ITERATIONS:
-            print(
-                f"\n\033[91mStopping: hit the {MAX_ITERATIONS}-turn safety cap. "
-                "The task may be stuck in a loop, or may just be larger than "
-                "this harness is tuned for. Check the plan above for progress "
-                "made so far.\033[0m"
-            )
+            if verbose:
+                print(
+                    f"\n\033[91mStopping: hit the {MAX_ITERATIONS}-turn safety cap. "
+                    "The task may be stuck in a loop, or may just be larger than "
+                    "this harness is tuned for. Check the plan above for progress "
+                    "made so far.\033[0m"
+                )
             break
 
         # The model's turn (including its tool calls) must be appended
@@ -162,9 +165,9 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY) -> No
                              f"Raw arguments received: {raw_args[:300]!r}. "
                              "Retry the call with valid JSON arguments."
                 })
-            elif needs_confirmation(tc.name, args):
+            elif interactive and needs_confirmation(tc.name, args):
                 if confirm(tc.name, args):
-                    result = execute_tool(tc.name, args)
+                    result = execute_tool(tc.name, args, model_key)
                 else:
                     print("\033[91mDenied.\033[0m")
                     result = json.dumps({
@@ -173,7 +176,7 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY) -> No
                                  "or try a different approach."
                     })
             else:
-                result = execute_tool(tc.name, args)
+                result = execute_tool(tc.name, args, model_key)
 
             if verbose:
                 if tc.name == "todo_write":
@@ -195,6 +198,8 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY) -> No
             history = [Turn(role="user", text=compact_text)]
         else:
             history.append(Turn(role="user", tool_results=tool_results))
+
+    return final_text
 
 
 if __name__ == "__main__":

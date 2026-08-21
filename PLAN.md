@@ -92,19 +92,29 @@ built from the todo checklist + most recent tool results). Needed because
 some providers (Gemini's Interactions API) manage history server-side with
 no way to selectively drop old turns.
 
-### 4. 🟡 API Vault & Routing
-- **Vault (partial):** `providers/config.py`'s `MODEL_REGISTRY` is the
-  config surface — each entry names the env var holding its key, real
-  values live in `.env`. This is a developer-facing vault, not a
-  user-facing one: it's a plaintext local `.env` file, not secure per-user
-  cloud storage, and only `GEMINI_API_KEY` is actually populated right now
-  (Anthropic/DeepSeek/Moonshot are registered but keyless).
-- **Routing (not started):** model selection today is a manual CLI arg
-  (`python agent.py "task" deepseek-chat`). No logic yet to route different
-  steps of a task to different models automatically.
-- **Remaining work:** real per-user encrypted key storage; a
-  vault UI/API; routing logic (rule-based or orchestrator-directed) to pick
-  which model handles which step.
+### 4. 🟡 API Vault & Routing — primitives merged (PR #3, `19b6657`)
+- **Vault (working, still local-only by design):** `core/vault.py` —
+  `get_key()`/`is_present()` (cheap, local, no network) vs `validate_key()`
+  (real API auth check via the new `Provider.validate()` in
+  `providers/base.py`, cached per-session). `list_models()` /
+  `available_models(require_validated=...)` give a real status view instead
+  of trusting "env var is non-empty" as "key works". Keys still live in
+  `.env` — deliberately not building encrypted/multi-user storage yet,
+  since there's no backend to protect it *for* until phase 7. Still only
+  `GEMINI_API_KEY` actually populated right now.
+- **Routing (working, role-based, not task-based):** `core/routing.py` —
+  `MODEL_REGISTRY` entries now carry a `tier` ("strong"/"cheap").
+  `pick_orchestrator()` fails loud if no strong-tier key validates (no
+  silent downgrade of the orchestrator role). `pick_executor()`/
+  `pick_executors(n)` prefer cheap-tier, degrade to any present key if
+  none exists, and never return duplicates (`exclude` set grows each
+  pick). Deliberately role-based only — task-based/cost-aware routing has
+  no orchestrator yet to consume it, so building it now would be
+  speculative; that's phase 5's problem once phase 5 exists.
+- **Remaining work:** nothing wires `agent.py`'s CLI to actually use
+  routing yet (it still takes a manual `model_key` arg) — that's UX, not
+  design, and deliberately deferred until phase 5 needs it. Real
+  encrypted/multi-user key storage and any vault UI are phase 7 concerns.
 
 ### 5. ⬜ Orchestrator, executors & shared memory
 Not started. This is the core multi-agent feature:

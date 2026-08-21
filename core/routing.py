@@ -51,7 +51,7 @@ def pick_orchestrator() -> str:
     )
 
 
-def pick_executor(exclude: frozenset[str] = frozenset()) -> str:
+def pick_executor(exclude: frozenset[str] = frozenset(), preferred: str | None = None) -> str:
     """
     A model for the executor role, not already in `exclude` (so
     pick_executors() below can assemble several distinct ones). Prefers a
@@ -65,7 +65,19 @@ def pick_executor(exclude: frozenset[str] = frozenset()) -> str:
     regardless of tier (even the orchestrator's strong-tier model) — an
     expensive executor beats no executor for early development, where most
     setups won't have every registry slot filled in.
+
+    `preferred`: an explicit model request (e.g. "use kimi-k2 for this
+    frontend task"). Unlike the generic fallback above, this fails loud if
+    it can't be honored — an explicit choice had a reason, so silently
+    substituting a different model would defeat it.
     """
+    if preferred is not None:
+        if preferred in exclude:
+            raise RoutingError(f"requested executor {preferred!r} already used in this batch")
+        if not vault.is_present(preferred):
+            raise RoutingError(f"requested executor {preferred!r} has no API key configured")
+        return preferred
+
     cheap_candidates = [
         k for k in MODEL_REGISTRY if get_tier(k) == "cheap" and k not in exclude and vault.is_present(k)
     ]
