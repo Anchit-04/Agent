@@ -1,8 +1,6 @@
-// sandboxd is a long-lived local process that runs shell commands on behalf
-// of the Python agent. It reads one JSON request per line from stdin, runs
-// it inside a Windows Job Object (hard memory ceiling + guaranteed
-// whole-process-tree kill on timeout), and writes one JSON response per
-// line back to stdout.
+// sandboxd runs shell commands on behalf of the Python agent, contained in
+// a Windows Job Object (hard memory ceiling, guaranteed process-tree kill
+// on timeout). One JSON request per line in, one JSON response per line out.
 package main
 
 import (
@@ -19,33 +17,17 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// Request is one line of JSON coming in from the caller (Python, eventually).
 type Request struct {
 	Command string `json:"command"`
 }
 
-// Response mirrors the shape agent.py's run_bash_command already returns,
-// so swapping the Python implementation for a call into this binary later
-// is a drop-in change — nothing above execute_tool() needs to know it moved.
 type Response struct {
 	ExitCode int    `json:"exit_code"`
 	Output   string `json:"output"`
 }
 
-// MaxCapturedOutputBytes bounds how much of a command's stdout/stderr
-// sandboxd will hold onto. The Job Object's memory limit only covers the
-// *child* process (it's assigned the child's PID, see AssignProcessToJobObject
-// below) — it does nothing to cap growth in sandboxd's own memory. Without
-// this, a command that just prints a lot (well within the timeout, so the
-// Job Object never fires) could grow sandboxd's own heap unboundedly, and
-// sandboxd is long-lived and shared across the whole agent session, so that
-// would take down every command still to come, not just this one. Generous
-// on purpose — this is a memory-safety backstop, not the context-budget
-// truncation sandbox_client.py already does on the Python side at 8000 chars.
 const MaxCapturedOutputBytes = 2 * 1024 * 1024 // 2MB
 
-// limitedWriter caps how many bytes it will buffer, silently discarding
-// anything past the limit instead of growing forever.
 type limitedWriter struct {
 	buf       bytes.Buffer
 	limit     int
@@ -56,7 +38,7 @@ func (w *limitedWriter) Write(p []byte) (int, error) {
 	remaining := w.limit - w.buf.Len()
 	if remaining <= 0 {
 		w.truncated = true
-		return len(p), nil // report success — the command shouldn't see a write error just because we stopped keeping its output
+		return len(p), nil
 	}
 	if len(p) > remaining {
 		w.buf.Write(p[:remaining])
@@ -80,8 +62,6 @@ func main() {
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			// Most commonly: stdin closed (the caller exited or piped EOF).
-			// That's a normal way for this process's life to end, not a crash.
 			return
 		}
 
@@ -96,24 +76,13 @@ func main() {
 	}
 }
 
-// Fixed defaults for now — per-request overrides (via the Request JSON) are
-// a deliberate fast-follow, not done here, so this change stays scoped to
-// "add containment" without also redesigning the wire protocol at the same time.
 const (
 	DefaultTimeout             = 30 * time.Second
 	DefaultMemoryLimitMB int64 = 512
 )
 
-// runContained runs command with real OS-level containment via a Windows
-// Job Object: a hard memory ceiling and a guaranteed kill of the entire
-// process tree (including any children the command spawns) on timeout.
 func runContained(command string, timeout time.Duration, memoryLimitMB int64) Response {
-	// Built via exec.Command("cmd", "/C", command) originally, but Go escapes
-	// each Args element assuming MSVCRT-style argv parsing on the far end —
-	// any `"` in command comes out as a literal `\"`, which cmd.exe does NOT
-	// unescape the same way. That silently corrupted every quoted command
-	// (git commit -m "...", python -c "...", etc). Setting SysProcAttr.CmdLine
-	// directly bypasses Go's escaping and hands cmd.exe the raw line we mean.
+
 	cmd := exec.Command("cmd")
 	cmd.SysProcAttr = &syscall.SysProcAttr{CmdLine: `/C ` + command}
 
@@ -147,12 +116,6 @@ func runContained(command string, timeout time.Duration, memoryLimitMB int64) Re
 		return Response{ExitCode: -1, Output: fmt.Sprintf("failed to configure job object: %v", err)}
 	}
 
-	// NOTE: there's a small window between cmd.Start() above and this
-	// assignment where the process runs outside containment. A fully
-	// race-free version would start it suspended (CREATE_SUSPENDED) and
-	// resume only after assignment; for our threat model (containing our
-	// own tool calls, not defeating an adversary racing this exact attach
-	// step) this gap is an accepted, explicit trade-off, not an oversight.
 	processHandle, err := windows.OpenProcess(
 		windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE,
 		false,
@@ -194,9 +157,6 @@ func runContained(command string, timeout time.Duration, memoryLimitMB int64) Re
 func writeResponse(resp Response) {
 	data, err := json.Marshal(resp)
 	if err != nil {
-		// Marshaling our own Response struct should never actually fail,
-		// but silently dropping a response would hang the caller forever
-		// waiting for a reply that's never coming — surface it instead.
 		fmt.Fprintf(os.Stdout, `{"exit_code":-1,"output":"internal error marshaling response: %v"}`+"\n", err)
 		return
 	}

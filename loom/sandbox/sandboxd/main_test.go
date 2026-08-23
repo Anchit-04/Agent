@@ -7,20 +7,14 @@ import (
 	"time"
 )
 
-// Verifies the actual point of the Job Object plumbing: on timeout, the
-// entire process tree (including grandchildren the command spawns, not just
-// the immediate cmd.exe) is really killed — not just detached from us while
-// it keeps running and writing.
+// Verifies the whole process tree (not just cmd.exe itself) is really
+// killed on timeout, not just detached while it keeps running.
 func TestRunContained_TimeoutKillsProcessTree(t *testing.T) {
 	dir := t.TempDir()
 	counter := filepath.Join(dir, "counter.txt")
 
-	// A loop that appends to counter.txt once a second via a child ping,
-	// for up to 20s if left unkilled — far longer than our 2s timeout below.
-	// No quotes around the path: exec.Command on Windows backslash-escapes
-	// embedded quotes when building the argv for "cmd /C <string>", which
-	// cmd.exe then chokes on. t.TempDir() paths don't contain spaces, so
-	// this is safe without quoting.
+	// Appends to counter.txt once a second for up to 20s if left unkilled —
+	// far longer than our 2s timeout below.
 	cmd := `for /L %i in (1,1,20) do (echo %i>>` + counter + ` & ping -n 2 127.0.0.1 >nul)`
 
 	start := time.Now()

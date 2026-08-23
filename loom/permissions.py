@@ -60,11 +60,7 @@ def confirm(tool_name: str, args: dict) -> bool:
     try:
         answer = input("Allow? [y]es / [n]o / [a]lways for this tool: ").strip().lower()
     except EOFError:
-        # No interactive stdin to ask on (background process, CI, anything
-        # without a real TTY) — input() raises immediately rather than
-        # blocking. Fail safe: deny, don't crash. run_agent() already turns
-        # a denial into a normal "user denied" tool-result the model can
-        # react to, so this reuses that path for free.
+        # No TTY to ask on (background/CI) — fail safe: deny, don't crash.
         print("\033[91mNo interactive input available — denying by default.\033[0m")
         return False
 

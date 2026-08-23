@@ -32,19 +32,9 @@ class PathTraversalError(Exception):
 
 
 def _resolve(path: str) -> Path:
-    """
-    Resolve `path` relative to WORKDIR and verify the result actually stays
-    inside WORKDIR.
-
-    Plain `Path(WORKDIR) / path` (the old implementation) trusted the input:
-    a '..'-laden path walks out of the sandbox, and — more sharply — joining
-    with an *absolute* path doesn't append it, it replaces the base entirely
-    (Path(".") / "C:\\Windows" == "C:\\Windows"). Either way the model
-    ends up able to read/write anywhere the OS user can, not just the
-    project folder. We resolve to an absolute path first and then check
-    containment, which catches both cases (and symlinks that point out)
-    the same way.
-    """
+    """Resolve `path` relative to WORKDIR and verify it stays inside WORKDIR.
+    Plain path-joining trusted the input — a '..' or an absolute path could
+    escape the sandbox — so this resolves to absolute first, then checks containment."""
     root = Path(WORKDIR).resolve()
     candidate = (root / path).resolve()
     try:
@@ -102,11 +92,8 @@ def _leading_whitespace(line: str) -> str:
 
 
 def _apply_indent_delta(new_lines: list, old_indent: str, matched_indent: str) -> list:
-    """
-    Shift every non-blank line of the replacement by the same amount the
-    matched block's indentation differed from old_str's indentation — so
-    a whitespace-tolerant match doesn't leave the replacement mis-indented.
-    """
+    """Shift the replacement's indentation by however much the matched block
+    differed from old_str's, so a whitespace-tolerant match doesn't come out mis-indented."""
     delta = len(matched_indent) - len(old_indent)
     if delta == 0:
         return new_lines
@@ -123,16 +110,9 @@ def _apply_indent_delta(new_lines: list, old_indent: str, matched_indent: str) -
 
 
 def edit_file(path: str, old_str: str, new_str: str) -> str:
-    """
-    Replace old_str with new_str in a file.
-
-    Tier 1: exact substring match. Requires exactly one occurrence — zero or
-    multiple is a loud, safe failure rather than a guess.
-    Tier 2 (fallback, only if tier 1 finds zero matches): whitespace-tolerant
-    line match — compares lines ignoring leading/trailing whitespace, so
-    reformatted/re-indented code still matches. Still requires exactly one
-    match, and re-applies the correct indentation to the replacement.
-    """
+    """Replace old_str with new_str. Tier 1: exact match, must be unique.
+    Tier 2 (only if tier 1 finds nothing): whitespace-tolerant line match,
+    still must be unique, re-indents the replacement to fit."""
     try:
         p = _resolve(path)
         content = p.read_text(encoding="utf-8")
@@ -194,11 +174,8 @@ def edit_file(path: str, old_str: str, new_str: str) -> str:
 # --- list_directory ---------------------------------------------------------
 
 def list_directory(path: str = ".", max_depth: int = 2) -> str:
-    """
-    List files and folders under path, up to max_depth, skipping noisy dirs.
-    Cross-platform by construction — this is what run_bash_command's ls/dir/
-    find inconsistency across OSes was standing in for.
-    """
+    """List files and folders under path, up to max_depth, skipping noisy dirs.
+    Cross-platform, unlike shelling out to ls/dir/find."""
     try:
         root = _resolve(path)
     except PathTraversalError as e:

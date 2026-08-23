@@ -3,15 +3,14 @@
 import json
 import sys
 
-import routing
+from config import routing, preferences
 import memory
 import dispatch
-import preferences
 from injection import InjectionQueue
 from agent import EventSink, _emit
 from context import MAX_ITERATIONS, COMPACT_EVERY, build_compact_input
 from providers import get_provider, Turn, ToolResult
-from todo_tool import TODO_TOOLS, TODO_TOOL_HANDLERS, TodoManager
+from tools.todo_tool import TODO_TOOLS, TODO_TOOL_HANDLERS, TodoManager
 
 DELEGATE_TASK_TOOL = {
     "type": "function",
@@ -62,18 +61,10 @@ def execute_orchestrator_tool(name: str, args: dict, model_key: str, todo_manage
 def run_orchestrator(task: str, verbose: bool = True, model_key: str | None = None,
                       event_sink: "EventSink | None" = None, mem: "memory.Memory | None" = None,
                       injection_queue: "InjectionQueue | None" = None) -> str:
-    """event_sink events use task_id=None for orchestrator-level events (its
-    own turns/tool calls), matching the WebSocket protocol convention — a
-    real task_id always means a specific delegated task instead. mem
-    defaults to memory.DEFAULT_MEMORY for standalone use (no server
-    attached); a real backend passes a session-scoped instance instead —
-    every delegated executor shares this same instance too, so an
-    orchestrator's whole session (itself + every executor it spawns) has
-    exactly one shared log, isolated from any other session's.
-    injection_queue defaults to a fresh one if not given — shared with
-    every executor this run spawns, so a human_message with task_id=None
-    reaches the orchestrator itself, and a real task_id reaches that
-    specific executor, both via the same queue."""
+    """task_id=None on emitted events means the orchestrator itself, same
+    convention dispatch.py uses for delegated tasks. mem/injection_queue
+    default to fresh/standalone instances but are meant to be passed in by
+    the server, shared with every executor this run spawns."""
     model_key = model_key or routing.pick_orchestrator()
     provider = get_provider(model_key)
     todo_manager = TodoManager()  # own instance per session — never shared, no lock needed

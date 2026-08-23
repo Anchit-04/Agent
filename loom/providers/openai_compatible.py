@@ -43,16 +43,8 @@ class OpenAICompatibleProvider(Provider):
             try:
                 args = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError as e:
-                # Cheaper/smaller models routed through this adapter (DeepSeek,
-                # Kimi) can return truncated or otherwise malformed JSON here,
-                # especially near max_tokens — a real, expected occurrence,
-                # not just theoretical. We still owe the model a ToolResult
-                # for every ToolCall.id it emitted (dropping this entry would
-                # desync the conversation), so hand back an empty-args call
-                # flagged via `raw` — agent.py checks for this before actually
-                # invoking the tool, and turns it into a normal tool-error
-                # result the model sees and can retry, instead of this
-                # exception propagating uncaught and killing the whole session.
+                # Cheaper models can return truncated JSON here — still owe a
+                # ToolResult for this call_id, so flag it via `raw` instead of dropping it.
                 tool_calls.append(ToolCall(
                     id=tc.id, name=tc.function.name, args={},
                     raw={"args_parse_error": str(e), "raw_arguments": tc.function.arguments},

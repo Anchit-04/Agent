@@ -1,13 +1,7 @@
 """
-Mid-flight human message injection. One InjectionQueue per session, shared
-by the orchestrator's own loop and every executor it spawns — keyed by
-task_id (None = the orchestrator itself, a real id = that specific
-executor), matching the same task_id convention used everywhere else.
-
-Pushed to by server.py's WebSocket handler thread when a human_message
-arrives; drained by whichever loop owns that task_id, between its own
-turns — never mid-tool-call, so an in-flight tool round-trip is never
-corrupted by a message landing halfway through it.
+Mid-flight human message injection. One queue per session, keyed by task_id
+(None = orchestrator, real id = that executor). Drained between an agent's
+own turns, never mid-tool-call.
 """
 
 import threading

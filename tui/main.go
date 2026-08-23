@@ -1,8 +1,6 @@
-// tui is the terminal client — connects to core/server.py over WebSocket
-// (not wired up yet, this is the rendering scaffold first). Chat window
-// defaults to the orchestrator's conversation; the card stack (right side)
-// switches between meta views (Snapshot taker, Personas, Vault, more TBD)
-// via a discrete cycle, not smooth animation — see PLAN.md for why.
+// tui is the terminal client — connects to loom/server.py over WebSocket
+// (not wired up yet, this is the rendering scaffold). Chat defaults to the
+// orchestrator's conversation; the card stack cycles discretely, not smoothly.
 package main
 
 import (
@@ -108,10 +106,8 @@ func (m model) View() tea.View {
 	return v
 }
 
-// renderCardStack approximates the sketch's overlap: a terminal can't
-// truly overlap two cells, so depth is suggested via left-indent + dimming
-// on cards further from the focused one instead. Cycling is discrete
-// (up/down), not smooth circular motion — see PLAN.md for why.
+// renderCardStack approximates overlap via left-indent + dimming on cards
+// further from the focused one — a terminal can't truly overlap two cells.
 func renderCardStack(focused, width int) string {
 	rendered := make([]string, len(cards))
 	for i, c := range cards {

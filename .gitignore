@@ -5,4 +5,4 @@ __pycache__/
 # Go build artifacts — compiled per-platform, never source, never committed.
 *.exe
 *.exe~
-core/sandboxd/sandboxd
+loom/sandbox/sandboxd/sandboxd

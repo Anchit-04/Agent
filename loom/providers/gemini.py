@@ -31,10 +31,8 @@ class GeminiProvider(Provider):
         )
         response = self._generate_with_retry(contents, config)
 
-        # Walk the raw parts (not response.function_calls) so we can carry each
-        # call's thought_signature along with it — Gemini 3's thinking models
-        # reject a resent function_call part that's missing the signature it
-        # was originally issued with, so we have to round-trip it verbatim.
+        # Walk the raw parts, not response.function_calls, so we can carry each
+        # call's thought_signature along — Gemini 3 rejects a resent call missing it.
         parts = response.candidates[0].content.parts if response.candidates else []
         fc_parts = [p for p in parts if p.function_call is not None]
         # Gemini doesn't hand back call ids — synthesize positional ones so
@@ -51,11 +49,8 @@ class GeminiProvider(Provider):
         return ProviderResponse(text=response.text, tool_calls=tool_calls)
 
     def _generate_with_retry(self, contents, config):
-        """
-        Retries on 429s. The free tier is rate-limited (as low as 5 req/min
-        on some models) and an agent loop burns one request per tool
-        round-trip, so getting throttled mid-task is expected, not a bug.
-        """
+        """Retries on 429s — the free tier's rate limit gets hit often enough
+        (one request per tool round-trip) that this is expected, not a bug."""
         for attempt in range(MAX_RETRIES):
             try:
                 return self._client.models.generate_content(

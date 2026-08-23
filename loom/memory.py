@@ -1,13 +1,9 @@
 """
 Shared memory: one markdown file all agents in a session read from and write to.
 
-Was a module-level global (one file, one lock, one counter) — fine for a
-single session, but with multi-session/multi-project now decided, two
-unrelated sessions would silently share one memory log. Fixed the same way
-todo_tool.py was: state moved into a per-instance class (Memory), one
-instance per session, so no lock contention or cross-session leakage.
-DEFAULT_MEMORY exists only for the standalone single-agent CLI, which has
-no session concept at all — everything else gets its own instance.
+Used to be a module-level global — fine for one session, but two sessions
+would've silently shared the same log. Now a per-instance class, one Memory
+per session; DEFAULT_MEMORY is only for the standalone single-agent CLI.
 """
 
 import itertools

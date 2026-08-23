@@ -1,26 +1,10 @@
 """
-Context management for mini-agent.
+Context management: nothing truncates the growing turn history on its own,
+so we periodically replace it with a compact summary instead. Safe because
+todo_write already externalizes the one thing that matters — progress.
 
-The Gemini Interactions API manages conversation state server-side via
-previous_interaction_id — you never see or truncate the message list
-yourself, unlike the Anthropic version of this harness. That's convenient,
-but it also means the underlying context keeps growing every single turn
-with no way to selectively drop old, no-longer-relevant tool results. A long
-task will eventually hit the model's context window regardless.
-
-This module implements the same fix real harnesses use: periodically
-abandon the interaction chain and start a fresh one from a compact summary,
-instead of an ever-growing history. This works cheaply here because the
-todo_write tool already externalizes the one thing that actually matters —
-progress and remaining steps — so nothing essential is lost by dropping the
-raw turn-by-turn history.
-
-Two independent limits:
-  - COMPACT_EVERY : after this many turns, reset the chain (soft limit,
-                     the agent keeps working, just with a smaller context)
-  - MAX_ITERATIONS : hard stop — abandon the task entirely past this many
-                     turns, so a confused/looping agent can't run forever
-                     (or burn through your free-tier quota unattended)
+COMPACT_EVERY: soft reset (smaller context, task keeps going).
+MAX_ITERATIONS: hard stop, so a looping agent can't run forever.
 """
 
 MAX_ITERATIONS = 30

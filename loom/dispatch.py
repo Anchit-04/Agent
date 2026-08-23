@@ -3,7 +3,7 @@
 import threading
 import time
 
-import routing
+from config import routing
 import memory
 from paths import PROJECT_ROOT
 from agent import run_agent, EventSink, _emit
@@ -136,9 +136,8 @@ def execute_delegate_tasks(calls: list, scheduler: ScopeScheduler, event_sink: "
     external = {tc.id: set(tc.args.get("depends_on", [])) - batch_ids for tc in calls}
     graph = DependencyGraph(deps)
 
-    # Emitted once per task, before any thread starts — the only place the
-    # graph *structure* (not just status transitions) is ever available,
-    # so this is what a client rebuilds the flow graph from.
+    # Emitted once per task before any thread starts — this is what a client
+    # rebuilds the flow graph from (structure, not just status transitions).
     for tc in calls:
         _emit(event_sink, "task_created", {
             "task_id": tc.id,

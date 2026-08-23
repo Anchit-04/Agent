@@ -1,42 +1,29 @@
 """
-mini-agent — provider-agnostic edition.
-
-The harness owns the full conversation history locally as a list of neutral
-Turn objects (providers/base.py) and resends it in full on every call — same
-loop shape no matter which model is answering. Which model that is comes
-entirely from providers/config.py's MODEL_REGISTRY; this file never imports
-a provider SDK directly, only providers.get_provider(). Swapping models, or
-later routing different steps of the same task to different models, is a
-config change here, not a rewrite.
+mini-agent — provider-agnostic edition. Never imports a provider SDK
+directly, only providers.get_provider() — swapping models is a config
+change in providers/config.py, not a rewrite.
 
 Usage:
     python agent.py "list the files in this directory and tell me what this project does"
-    python agent.py "..." deepseek-chat     # optional 2nd arg: model key from providers/config.py
-
-Each entry in MODEL_REGISTRY documents which env var needs to hold that
-provider's API key (set it in .env).
+    python agent.py "..." deepseek-chat     # optional 2nd arg: model key
 """
 
 import sys
 import json
 from typing import Callable
 
-from file_tools import FILE_TOOLS, FILE_TOOL_HANDLERS
-from todo_tool import TODO_TOOLS, TODO_TOOL_HANDLERS, TodoManager
+from tools.file_tools import FILE_TOOLS, FILE_TOOL_HANDLERS
+from tools.todo_tool import TODO_TOOLS, TODO_TOOL_HANDLERS, TodoManager
 from permissions import needs_confirmation, confirm
 from context import MAX_ITERATIONS, COMPACT_EVERY, build_compact_input
 from providers import get_provider, Turn, ToolResult
-from sandbox_client import run_bash_command
+from sandbox.sandbox_client import run_bash_command
 import memory
 
 MODEL_KEY = "gemini-flash"          # default entry in providers/config.py's MODEL_REGISTRY
 
-# NOTE: the working directory the agent is sandboxed to is currently set in
-# three separate places — here's not one of them anymore (bash execution
-# moved to sandbox_client.py's own WORKDIR); file_tools.py has its own too.
-# Real fix is centralizing this into one shared config module — tracked as
-# a follow-up, not done in this change to keep it scoped to "wire up
-# sandboxd," but worth knowing before you go looking for "the" WORKDIR.
+# WORKDIR is set in three separate places right now (not here) —
+# sandbox_client.py and file_tools.py each have their own. Should centralize.
 
 SYSTEM_PROMPT = """You are a coding agent. You have access to:
 - read_file, write_file, edit_file, search_files — dedicated tools for inspecting
@@ -63,10 +50,9 @@ Rules:
 - When you are finished, respond with plain text and no further tool calls.
 """
 
-# --- Tool definitions -----------------------------------------------------
-# Plain dicts (JSON-schema shaped) so they're reusable across providers
-# unchanged — each provider adapter converts them into its own SDK's tool
-# format internally (see providers/*.py).
+# --- Tool definitions --------------------------------------------------------
+# Plain JSON-schema dicts — each provider adapter converts these to its own
+# tool format (see providers/*.py).
 
 BASH_TOOL = {
     "type": "function",
@@ -90,9 +76,8 @@ BASH_TOOL = {
 
 ALL_TOOLS = [BASH_TOOL] + FILE_TOOLS + TODO_TOOLS + memory.MEMORY_TOOLS
 
-# One callback shape used everywhere events get emitted: (event_type, payload).
-# None (the default) means "no server attached" — behaves exactly as before
-# this refactor, purely additive so the single-agent CLI is unaffected.
+# event_sink is None by default (no server attached) — purely additive, the
+# single-agent CLI is unaffected.
 EventSink = Callable[[str, dict], None]
 
 
@@ -101,7 +86,7 @@ def _emit(event_sink: "EventSink | None", event_type: str, payload: dict) -> Non
         event_sink(event_type, payload)
 
 
-# --- Tool execution ---------------------------------------------------------
+# --- Tool execution -----------------------------------------------------------
 
 def execute_tool(name: str, args: dict, model_key: str, todo_manager: TodoManager, mem: memory.Memory) -> str:
     if name == "run_bash_command":
@@ -115,28 +100,20 @@ def execute_tool(name: str, args: dict, model_key: str, todo_manager: TodoManage
     return json.dumps({"error": f"Unknown tool: {name}"})
 
 
-# --- The agent loop ---------------------------------------------------------
+# --- The agent loop -----------------------------------------------------------
 
 def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, interactive: bool = True,
               task_id: str | None = None, event_sink: "EventSink | None" = None,
               mem: "memory.Memory | None" = None, injection_queue=None) -> str:
-    """interactive=False skips the confirm() gate — used when running as a
-    concurrent executor (Phase 5), since input() across threads is broken.
-    task_id/event_sink are Phase 6 additions for the server: task_id tags
-    every emitted event (None for standalone CLI use, a real id when this
-    is one of dispatch.py's executors); event_sink is None by default so
-    nothing changes for the existing single-agent CLI. mem defaults to
-    memory.DEFAULT_MEMORY (the single-agent CLI's shared file) — dispatch.py
-    passes a session-scoped instance instead when running as an executor.
-    injection_queue (injection.InjectionQueue) lets a human's mid-flight
-    message reach this specific task_id — drained once per loop iteration,
-    right before the next provider.generate() call, never mid-tool-call."""
+    """interactive=False skips the confirm() gate — used by concurrent
+    executors, since input() breaks across threads. task_id/event_sink/mem/
+    injection_queue are the server hooks (all optional, all defaulted so the
+    plain CLI still works unchanged)."""
     provider = get_provider(model_key)
     todo_manager = TodoManager()  # own instance per run — never shared, no lock needed
     mem = mem or memory.DEFAULT_MEMORY
 
-    # This list IS the conversation. We own it, we grow it, we can compact
-    # it — nothing about it depends on any provider retaining state.
+    # This list IS the conversation — resent in full every call.
     history = [Turn(role="user", text=task)]
 
     turn_count = 0
@@ -169,12 +146,9 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, inter
             _emit(event_sink, "error", {"task_id": task_id, "message": f"hit the {MAX_ITERATIONS}-turn safety cap"})
             break
 
-        # The model's turn (including its tool calls) must be appended
-        # before we append the tool results — every provider expects to see
-        # its own prior turn in history before the results it's waiting on.
+        # Assistant turn has to land in history before its tool results do.
         history.append(Turn(role="assistant", text=response.text, tool_calls=response.tool_calls))
 
-        # Execute every tool call this turn and collect results.
         tool_results = []
         executed_results = []  # kept alongside tool_results for compaction summaries
         for tc in response.tool_calls:
@@ -185,10 +159,8 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, inter
             _emit(event_sink, "tool_call", {"task_id": task_id, "name": tc.name, "args": args})
 
             if tc.raw and tc.raw.get("args_parse_error"):
-                # Provider adapter couldn't parse this call's arguments as
-                # JSON (see openai_compatible.py) — don't attempt to execute
-                # it with empty/wrong args, just hand the model back a
-                # normal tool-error result it can react to.
+                # Adapter couldn't parse this call's JSON args — don't execute
+                # with empty/wrong args, hand back a tool-error the model can react to.
                 raw_args = tc.raw.get("raw_arguments", "")
                 result = json.dumps({
                     "error": f"Could not parse arguments for {tc.name}: {tc.raw['args_parse_error']}. "
@@ -222,9 +194,8 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, inter
             executed_results.append({"name": tc.name, "content": result})
 
         if turn_count % COMPACT_EVERY == 0:
-            # Real compaction — just replace our own local list, no
-            # server-side chain to abandon. See context.py for why nothing
-            # essential is lost (the todo list already externalizes progress).
+            # Drop the raw history, replace it with a summary — the todo list
+            # already externalizes progress, so nothing essential is lost.
             if verbose:
                 print(f"\033[95m[context] Compacting after {turn_count} turns — replacing history with a summary.\033[0m")
             compact_text = build_compact_input(task, todo_manager.render(), executed_results)

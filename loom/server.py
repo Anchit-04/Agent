@@ -1,20 +1,3 @@
-"""
-Persistent multi-session WebSocket backend. Owns orchestrator.py/dispatch.py/
-memory.py/vault.py/routing.py; the terminal UI (and later the desktop app)
-is a client attaching to this over the network, not a second copy of the
-backend logic.
-
-run_orchestrator() is fully synchronous (threading-based, not asyncio) — so
-each session runs in its own OS thread, and events cross into the asyncio
-event loop via run_coroutine_threadsafe(), the standard bridge for a sync
-worker thread talking to an async server.
-
-Session (server-side) is deliberately just a view built from the events
-run_orchestrator() already emits — it never reaches into ScopeScheduler/
-TodoManager/Memory internals directly. If the event coverage from the
-Phase 6 refactor is right, that's a complete picture, and it keeps the
-server decoupled from orchestrator internals.
-"""
 
 import asyncio
 import json
@@ -38,20 +21,20 @@ class SessionState:
     session_id: str
     task: str
     model_key: str | None = None
-    status: str = "running"  # running | done | failed
+    status: str = "running"  
     final_text: str = ""
-    todos: str = ""  # orchestrator-level checklist (task_id=None)
-    tasks: dict = field(default_factory=dict)  # task_id -> {description, scope, depends_on} — the flow graph's nodes/edges
-    task_statuses: dict = field(default_factory=dict)  # task_id -> running/waiting-.../done/failed
-    turns: list = field(default_factory=list)  # {type, payload} log, for reconnect/replay
+    todos: str = "" 
+    tasks: dict = field(default_factory=dict)  
+    task_statuses: dict = field(default_factory=dict)
+    turns: list = field(default_factory=list)  
 
 
 class Session:
     def __init__(self, session_id: str, task: str):
         self.session_id = session_id
         self.state = SessionState(session_id=session_id, task=task)
-        self.clients: set = set()  # ServerConnections attached to this session
-        self.injection_queue = InjectionQueue()  # shared by the orchestrator itself and every executor it spawns
+        self.clients: set = set()  
+        self.injection_queue = InjectionQueue() 
         self._lock = threading.Lock()
         self.loop: asyncio.AbstractEventLoop | None = None
 
@@ -61,8 +44,6 @@ class Session:
             path.write_text(json.dumps(asdict(self.state), indent=2), encoding="utf-8")
 
     def handle_event(self, event_type: str, payload: dict) -> None:
-        """The event_sink passed into run_orchestrator() — called from the
-        session's own worker thread, never the event loop's thread."""
         with self._lock:
             if event_type == "agent_turn" and payload.get("task_id") is None:
                 self.state.model_key = payload.get("model_key")
@@ -77,7 +58,7 @@ class Session:
             if event_type == "task_status_changed" and payload.get("task_id") is not None:
                 self.state.task_statuses[payload["task_id"]] = payload.get("status")
             self.state.turns.append({"type": event_type, "payload": payload})
-        self.persist()  # continuous — every event, per the decided persistence model
+        self.persist() 
         self._broadcast(event_type, payload)
 
     def _broadcast(self, event_type: str, payload: dict) -> None:
@@ -92,7 +73,7 @@ async def _safe_send(ws, message: str) -> None:
     try:
         await ws.send(message)
     except Exception:
-        pass  # client already gone — not this session's problem, it keeps running
+        pass  
 
 
 SESSIONS: dict[str, Session] = {}
@@ -106,8 +87,6 @@ def _start_session(task: str, model_key: str | None, loop: asyncio.AbstractEvent
     with SESSIONS_LOCK:
         SESSIONS[session_id] = session
 
-    # Own memory log per session — the whole point of the memory.py fix:
-    # this session and every executor it spawns share it, no other session does.
     mem = memory.Memory(SESSIONS_DIR / session_id / "SHARED_MEMORY.md")
 
     def run():
@@ -154,8 +133,6 @@ async def handler(ws) -> None:
             await ws.send(json.dumps({"type": "attached", "session_id": session.session_id, "state": asdict(session.state)}))
 
         elif msg_type == "human_message":
-            # task_id omitted/null -> the orchestrator itself; a real task_id -> that executor.
-            # Always available, no grant needed (decided) — just needs a valid, running session.
             with SESSIONS_LOCK:
                 session = SESSIONS.get(msg.get("session_id"))
             if session is None:
@@ -174,8 +151,7 @@ async def handler(ws) -> None:
 async def main(host: str = "localhost", port: int = 8765) -> None:
     async with websockets.serve(handler, host, port):
         print(f"server.py listening on ws://{host}:{port}")
-        await asyncio.Future()  # run forever
-
+        await asyncio.Future()  
 
 if __name__ == "__main__":
     asyncio.run(main())

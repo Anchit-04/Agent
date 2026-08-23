@@ -40,15 +40,15 @@ lands.
 ### 1. ✅ Sandboxing — merged (PR #1, `68df41e`; hardened further in PR #2, `3de6705`)
 Real OS-level containment for tool execution, so the agent can't touch
 anything outside the project or run away with resources.
-- `core/file_tools.py` — `_resolve()` enforces WORKDIR containment (blocks
+- `loom/tools/file_tools.py` — `_resolve()` enforces WORKDIR containment (blocks
   `..` traversal and absolute-path escapes) for all file tools.
-- `core/sandboxd/` — Go binary using Windows Job Objects: hard memory
+- `loom/sandbox/sandboxd/` — Go binary using Windows Job Objects: hard memory
   ceiling + guaranteed whole-process-tree kill on timeout. Verified via
   `main_test.go` (timeout kills the tree) and `memlimit_test.go` (memory cap
   actually enforced). Output capture is now bounded (2MB) so a chatty
   command can't grow sandboxd's own memory unboundedly — that growth wasn't
   covered by the Job Object limit, which only bounds the child process.
-- `core/sandbox_client.py` — long-lived Python↔sandboxd bridge (one process
+- `loom/sandbox/sandbox_client.py` — long-lived Python↔sandboxd bridge (one process
   per session, restarts transparently if it dies). Every sandboxd failure
   mode is now handled explicitly rather than crashing the agent: missing
   binary, a hung sandboxd (client-side timeout backstop), a malformed
@@ -63,10 +63,10 @@ anything outside the project or run away with resources.
   merged into `main` as a regular merge (`68df41e`) preserving the atomic
   commit history.
 - PR #2: two more bugs surfaced by actually running the merged agent live
-  against the real Gemini API — `core/paths.py` now centralizes `WORKDIR`
+  against the real Gemini API — `loom/paths.py` now centralizes `WORKDIR`
   so it's the repo root regardless of which directory `agent.py` is
   launched from (previously relative to invocation cwd, so running from
-  `core/` silently broke every file path); `list_directory` added to
+  `loom/` silently broke every file path); `list_directory` added to
   `SAFE_TOOLS` and `confirm()` now fails safe on `EOFError` instead of
   crashing when there's no interactive stdin to ask on. Filed and fixed by
   Claude as verification follow-up, same self-review/self-merge pattern as
@@ -74,7 +74,7 @@ anything outside the project or run away with resources.
   account, self-approval blocked).
 
 ### 2. ✅ Provider abstraction (multi-model support)
-`core/providers/` — neutral `Turn`/`ToolCall`/`ToolResult` types
+`loom/providers/` — neutral `Turn`/`ToolCall`/`ToolResult` types
 (`base.py`), adapters for Anthropic, Gemini, and OpenAI-compatible
 (`anthropic.py`, `gemini.py`, `openai_compatible.py`), and a single registry
 (`config.py`) mapping short keys → provider + model id + env var. `agent.py`
@@ -86,14 +86,14 @@ if a cheaper model returns truncated/malformed tool-call JSON — it surfaces
 as a recoverable tool error instead.
 
 ### 3. ✅ Context management
-`core/context.py` — `MAX_ITERATIONS` (hard stop) and `COMPACT_EVERY` (soft
+`loom/context.py` — `MAX_ITERATIONS` (hard stop) and `COMPACT_EVERY` (soft
 reset: abandon the growing turn history, replace it with a compact summary
 built from the todo checklist + most recent tool results). Needed because
 some providers (Gemini's Interactions API) manage history server-side with
 no way to selectively drop old turns.
 
 ### 4. 🟡 API Vault & Routing — primitives merged (PR #3, `19b6657`)
-- **Vault (working, still local-only by design):** `core/vault.py` —
+- **Vault (working, still local-only by design):** `loom/config/vault.py` —
   `get_key()`/`is_present()` (cheap, local, no network) vs `validate_key()`
   (real API auth check via the new `Provider.validate()` in
   `providers/base.py`, cached per-session). `list_models()` /
@@ -102,7 +102,7 @@ no way to selectively drop old turns.
   `.env` — deliberately not building encrypted/multi-user storage yet,
   since there's no backend to protect it *for* until phase 7. Still only
   `GEMINI_API_KEY` actually populated right now.
-- **Routing (working, role-based, not task-based):** `core/routing.py` —
+- **Routing (working, role-based, not task-based):** `loom/config/routing.py` —
   `MODEL_REGISTRY` entries now carry a `tier` ("strong"/"cheap").
   `pick_orchestrator()` fails loud if no strong-tier key validates (no
   silent downgrade of the orchestrator role). `pick_executor()`/
@@ -117,12 +117,12 @@ no way to selectively drop old turns.
   encrypted/multi-user key storage and any vault UI are phase 7 concerns.
 
 ### 5. ✅ Orchestrator, executors & shared memory — merged (PR #4, `429c4d8`)
-- **Orchestrator (`core/orchestrator.py`):** `run_orchestrator()` — same
+- **Orchestrator (`loom/orchestrator.py`):** `run_orchestrator()` — same
   loop shape as `agent.py`'s `run_agent()`, but tool-restricted to
   `delegate_task`/`todo_write`/`memory_write`/`memory_read` only, enforced
   at the tool-list level (no bash/file access) so it can only plan, never
   execute directly. Picks its own model via `routing.pick_orchestrator()`.
-- **Dispatch (`core/dispatch.py`):** `ScopeScheduler` serializes tasks with
+- **Dispatch (`loom/dispatch.py`):** `ScopeScheduler` serializes tasks with
   overlapping declared file `scope` (via `threading.Condition`, not
   busy-polling); disjoint scope runs genuinely concurrently. `DependencyGraph`
   handles *logical* ordering (`depends_on`) separately from scope —
@@ -134,13 +134,13 @@ no way to selectively drop old turns.
   never an uncaught exception killing the batch — caught and fixed a real
   bug here mid-build where `pick_executor()`/`scheduler.acquire()` sat
   outside the try/except.
-- **Shared memory (`core/memory.py`, file: `SHARED_MEMORY.md`):** one
+- **Shared memory (`loom/memory.py`, file: `SHARED_MEMORY.md`):** one
   central markdown log, not per-agent/embedding-based — every completed
   task's result is logged automatically; `memory_write`/`memory_read` let
   any agent leave/pull notes manually. Every agent gets the file's header
   lines (cheap) folded into its prompt every turn; full entries are pulled
   in on demand, not force-fed.
-- **Model specialization (`core/preferences.py`):** two ways to route a
+- **Model specialization (`loom/config/preferences.py`):** two ways to route a
   specific sub-task to a specific model — a one-off `model_key` on
   `delegate_task` (stated in the task itself), or a durable specialty tag
   (`set_specialty("kimi-k2", "frontend / motion")`) that's folded into the
@@ -170,10 +170,10 @@ refactor done: `agent.py`/`orchestrator.py`/`dispatch.py` now take an
 `memory_entry_added`, `human_message_injected`, `error`) instead of just
 `print()`ing or staying silent. `todo_tool.py`/`memory.py` converted from
 module-level globals to per-instance `TodoManager`/`Memory` classes (fixes a
-real multi-session corruption bug). New `core/injection.py`
+real multi-session corruption bug). New `loom/injection.py`
 (`InjectionQueue`) lets a human message reach a running orchestrator or a
 specific executor mid-flight, drained once per loop iteration. New
-`core/server.py` — persistent multi-session WebSocket backend
+`loom/server.py` — persistent multi-session WebSocket backend
 (`websockets` — first real external pip dependency; **no
 requirements.txt/pyproject.toml exists yet, flagged not fixed**), with
 continuous per-session JSON persistence to `sessions/`. New `tui/` — a
@@ -181,12 +181,12 @@ separate Go module (Bubble Tea v2), currently a compiling rendering
 scaffold only (chat window + discrete card-cycle + input bar, matching
 Anchit's sketch) with **no WebSocket wiring to server.py yet** and no
 command/keybinding scheme designed yet (deliberately deferred). Personas
-and MCP connectivity (`core/mcp_client.py`) are designed on paper in the
+and MCP connectivity (`loom/mcp_client.py`) are designed on paper in the
 plan file but explicitly deferred, not started.
 
 ### 7. ⬜ Cloud deployment
 Not started. No Dockerfile, no infra/CI config, nothing cloud-facing yet —
-this is currently a local CLI script (`python core/agent.py "..."`) run
+this is currently a local CLI script (`python loom/agent.py "..."`) run
 against a local `.env`.
 
 ## Open questions for Anchit
