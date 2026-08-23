@@ -116,22 +116,73 @@ no way to selectively drop old turns.
   design, and deliberately deferred until phase 5 needs it. Real
   encrypted/multi-user key storage and any vault UI are phase 7 concerns.
 
-### 5. ⬜ Orchestrator, executors & shared memory
-Not started. This is the core multi-agent feature:
-- Orchestrator agent (strongest model) plans and delegates.
-- Executor agents (cheaper models) receive individual tasks and execute
-  using the existing tool set (bash, file tools, todo).
-- A shared memory space all agents read/write so executors' work stays
-  visible to the orchestrator and to each other, instead of each subagent
-  working from an isolated context.
-- Builds directly on #2 (provider abstraction) and #4 (routing).
+### 5. ✅ Orchestrator, executors & shared memory — merged (PR #4, `429c4d8`)
+- **Orchestrator (`core/orchestrator.py`):** `run_orchestrator()` — same
+  loop shape as `agent.py`'s `run_agent()`, but tool-restricted to
+  `delegate_task`/`todo_write`/`memory_write`/`memory_read` only, enforced
+  at the tool-list level (no bash/file access) so it can only plan, never
+  execute directly. Picks its own model via `routing.pick_orchestrator()`.
+- **Dispatch (`core/dispatch.py`):** `ScopeScheduler` serializes tasks with
+  overlapping declared file `scope` (via `threading.Condition`, not
+  busy-polling); disjoint scope runs genuinely concurrently. `DependencyGraph`
+  handles *logical* ordering (`depends_on`) separately from scope —
+  same-batch dependents block until the real dependency completes and
+  receive its result automatically; earlier-turn dependencies resolve
+  straight from shared memory, no waiting needed. Cycle detection fails
+  loud rather than deadlocking. A crashed executor thread still releases
+  its scope reservation (try/finally) and surfaces as a clean tool-error,
+  never an uncaught exception killing the batch — caught and fixed a real
+  bug here mid-build where `pick_executor()`/`scheduler.acquire()` sat
+  outside the try/except.
+- **Shared memory (`core/memory.py`, file: `SHARED_MEMORY.md`):** one
+  central markdown log, not per-agent/embedding-based — every completed
+  task's result is logged automatically; `memory_write`/`memory_read` let
+  any agent leave/pull notes manually. Every agent gets the file's header
+  lines (cheap) folded into its prompt every turn; full entries are pulled
+  in on demand, not force-fed.
+- **Model specialization (`core/preferences.py`):** two ways to route a
+  specific sub-task to a specific model — a one-off `model_key` on
+  `delegate_task` (stated in the task itself), or a durable specialty tag
+  (`set_specialty("kimi-k2", "frontend / motion")`) that's folded into the
+  orchestrator's prompt every turn. Both funnel through the same
+  `pick_executor(preferred=...)` path, which fails loud (not silent
+  fallback) if the specifically-requested model isn't actually available.
+  Gap: `set_specialty()` has no CLI/UI caller yet — set it by calling the
+  function directly until phase 6 gives it a real home.
+- Verified with real induced failures (overlap-vs-concurrency timing,
+  crash-releases-lock, 40-way concurrent memory writes with zero
+  corruption, cycle detection) plus one live run against the real Gemini
+  API — genuine concurrent dispatch confirmed by two independent
+  rate-limit hits, output verified on disk, not just self-reported. That
+  live run used one real model in both roles (only `GEMINI_API_KEY` is
+  configured) — the mechanism is proven, a true multi-model split isn't
+  yet, since that needs a strong-tier key (Anthropic) plus at least one
+  more cheap-tier key beyond Gemini.
 
-### 6. ⬜ Terminal UI
-Not started. Currently just `print()` statements with ANSI color codes in
-`agent.py` (colored role labels, inline confirmation prompts via `input()`).
-No real TUI framework (e.g. a `curses`/`rich`/`textual`-based interface) —
-no persistent layout, no multi-agent view (which matters once #5 lands and
-there are several subagents running concurrently to show).
+### 6. 🟡 Terminal UI — in progress, NOT YET COMMITTED (working tree only, branch `anchit/sandboxd`)
+Design fully worked out in the plan-mode file at
+`C:\Users\Lenovo\.claude\plans\let-s-go-with-markdown-quirky-stream.md`
+(client/server split over WebSocket, multi-session backend, hub-and-spoke +
+Hybrid A peer channels, Go+Bubble Tea client). Backend event-sourcing
+refactor done: `agent.py`/`orchestrator.py`/`dispatch.py` now take an
+`event_sink` callback and emit structured events (`agent_turn`, `tool_call`,
+`tool_result`, `task_created`, `task_status_changed`, `todo_updated`,
+`memory_entry_added`, `human_message_injected`, `error`) instead of just
+`print()`ing or staying silent. `todo_tool.py`/`memory.py` converted from
+module-level globals to per-instance `TodoManager`/`Memory` classes (fixes a
+real multi-session corruption bug). New `core/injection.py`
+(`InjectionQueue`) lets a human message reach a running orchestrator or a
+specific executor mid-flight, drained once per loop iteration. New
+`core/server.py` — persistent multi-session WebSocket backend
+(`websockets` — first real external pip dependency; **no
+requirements.txt/pyproject.toml exists yet, flagged not fixed**), with
+continuous per-session JSON persistence to `sessions/`. New `tui/` — a
+separate Go module (Bubble Tea v2), currently a compiling rendering
+scaffold only (chat window + discrete card-cycle + input bar, matching
+Anchit's sketch) with **no WebSocket wiring to server.py yet** and no
+command/keybinding scheme designed yet (deliberately deferred). Personas
+and MCP connectivity (`core/mcp_client.py`) are designed on paper in the
+plan file but explicitly deferred, not started.
 
 ### 7. ⬜ Cloud deployment
 Not started. No Dockerfile, no infra/CI config, nothing cloud-facing yet —

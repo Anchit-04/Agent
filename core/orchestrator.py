@@ -7,9 +7,11 @@ import routing
 import memory
 import dispatch
 import preferences
+from injection import InjectionQueue
+from agent import EventSink, _emit
 from context import MAX_ITERATIONS, COMPACT_EVERY, build_compact_input
 from providers import get_provider, Turn, ToolResult
-from todo_tool import TODO_TOOLS, TODO_TOOL_HANDLERS, render_todos, reset_todos
+from todo_tool import TODO_TOOLS, TODO_TOOL_HANDLERS, TodoManager
 
 DELEGATE_TASK_TOOL = {
     "type": "function",
@@ -49,28 +51,47 @@ Rules:
 ALL_ORCHESTRATOR_TOOLS = [DELEGATE_TASK_TOOL] + TODO_TOOLS + memory.MEMORY_TOOLS
 
 
-def execute_orchestrator_tool(name: str, args: dict, model_key: str) -> str:
+def execute_orchestrator_tool(name: str, args: dict, model_key: str, todo_manager: TodoManager, mem: memory.Memory) -> str:
     if name in TODO_TOOL_HANDLERS:
-        return TODO_TOOL_HANDLERS[name](args)
+        return TODO_TOOL_HANDLERS[name](todo_manager, args)
     if name in memory.MEMORY_TOOL_HANDLERS:
-        return memory.MEMORY_TOOL_HANDLERS[name](model_key, args)
+        return memory.MEMORY_TOOL_HANDLERS[name](mem, model_key, args)
     return json.dumps({"error": f"Unknown orchestrator tool: {name}"})
 
 
-def run_orchestrator(task: str, verbose: bool = True, model_key: str | None = None) -> str:
+def run_orchestrator(task: str, verbose: bool = True, model_key: str | None = None,
+                      event_sink: "EventSink | None" = None, mem: "memory.Memory | None" = None,
+                      injection_queue: "InjectionQueue | None" = None) -> str:
+    """event_sink events use task_id=None for orchestrator-level events (its
+    own turns/tool calls), matching the WebSocket protocol convention — a
+    real task_id always means a specific delegated task instead. mem
+    defaults to memory.DEFAULT_MEMORY for standalone use (no server
+    attached); a real backend passes a session-scoped instance instead —
+    every delegated executor shares this same instance too, so an
+    orchestrator's whole session (itself + every executor it spawns) has
+    exactly one shared log, isolated from any other session's.
+    injection_queue defaults to a fresh one if not given — shared with
+    every executor this run spawns, so a human_message with task_id=None
+    reaches the orchestrator itself, and a real task_id reaches that
+    specific executor, both via the same queue."""
     model_key = model_key or routing.pick_orchestrator()
     provider = get_provider(model_key)
-    reset_todos()
+    todo_manager = TodoManager()  # own instance per session — never shared, no lock needed
+    mem = mem or memory.DEFAULT_MEMORY
+    injection_queue = injection_queue or InjectionQueue()
     scheduler = dispatch.ScopeScheduler()
 
     history = [Turn(role="user", text=task)]
     turn_count, final_text = 0, ""
 
     while True:
+        for msg in injection_queue.drain(None):  # None = messages addressed to the orchestrator itself
+            history.append(Turn(role="user", text=f"[Message from human]: {msg}"))
+            _emit(event_sink, "human_message_injected", {"task_id": None, "content": msg})
         system_prompt = (
             ORCHESTRATOR_SYSTEM_PROMPT_BASE
             + "\n## Executor specialties\n" + preferences.render_for_prompt()
-            + "\n## Current shared memory index\n" + memory.read_index()
+            + "\n## Current shared memory index\n" + mem.read_index()
         )
         response = provider.generate(history, ALL_ORCHESTRATOR_TOOLS, system_prompt)
 
@@ -78,6 +99,7 @@ def run_orchestrator(task: str, verbose: bool = True, model_key: str | None = No
             final_text = response.text
             if verbose:
                 print(f"\n\033[94m[orchestrator/{model_key}]:\033[0m {response.text}")
+            _emit(event_sink, "agent_turn", {"task_id": None, "model_key": model_key, "text": response.text})
 
         if not response.tool_calls:
             break
@@ -85,6 +107,7 @@ def run_orchestrator(task: str, verbose: bool = True, model_key: str | None = No
         if turn_count >= MAX_ITERATIONS:
             if verbose:
                 print(f"\n\033[91mStopping: hit the {MAX_ITERATIONS}-turn safety cap.\033[0m")
+            _emit(event_sink, "error", {"task_id": None, "message": f"hit the {MAX_ITERATIONS}-turn safety cap"})
             break
 
         history.append(Turn(role="assistant", text=response.text, tool_calls=response.tool_calls))
@@ -94,10 +117,14 @@ def run_orchestrator(task: str, verbose: bool = True, model_key: str | None = No
 
         results_by_id: dict[str, ToolResult] = {}
         if delegate_calls:
-            for r in dispatch.execute_delegate_tasks(delegate_calls, scheduler):
+            for r in dispatch.execute_delegate_tasks(delegate_calls, scheduler, event_sink=event_sink, mem=mem, injection_queue=injection_queue):
                 results_by_id[r.call_id] = r
         for tc in other_calls:
-            content = execute_orchestrator_tool(tc.name, tc.args, model_key)
+            _emit(event_sink, "tool_call", {"task_id": None, "name": tc.name, "args": tc.args})
+            content = execute_orchestrator_tool(tc.name, tc.args, model_key, todo_manager, mem)
+            _emit(event_sink, "tool_result", {"task_id": None, "name": tc.name, "content": content})
+            if tc.name == "todo_write":
+                _emit(event_sink, "todo_updated", {"task_id": None, "checklist": todo_manager.render()})
             results_by_id[tc.id] = ToolResult(call_id=tc.id, name=tc.name, content=content)
 
         tool_results = [results_by_id[tc.id] for tc in response.tool_calls]  # preserve original order
@@ -107,7 +134,7 @@ def run_orchestrator(task: str, verbose: bool = True, model_key: str | None = No
                 print(f"\033[93m[{r.name}]\033[0m {r.content[:300]}")
 
         if turn_count % COMPACT_EVERY == 0:
-            compact_text = build_compact_input(task, render_todos(), [{"name": r.name, "content": r.content} for r in tool_results])
+            compact_text = build_compact_input(task, todo_manager.render(), [{"name": r.name, "content": r.content} for r in tool_results])
             history = [Turn(role="user", text=compact_text)]
         else:
             history.append(Turn(role="user", tool_results=tool_results))

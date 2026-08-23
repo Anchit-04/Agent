@@ -19,9 +19,10 @@ provider's API key (set it in .env).
 
 import sys
 import json
+from typing import Callable
 
 from file_tools import FILE_TOOLS, FILE_TOOL_HANDLERS
-from todo_tool import TODO_TOOLS, TODO_TOOL_HANDLERS, render_todos, reset_todos
+from todo_tool import TODO_TOOLS, TODO_TOOL_HANDLERS, TodoManager
 from permissions import needs_confirmation, confirm
 from context import MAX_ITERATIONS, COMPACT_EVERY, build_compact_input
 from providers import get_provider, Turn, ToolResult
@@ -89,28 +90,50 @@ BASH_TOOL = {
 
 ALL_TOOLS = [BASH_TOOL] + FILE_TOOLS + TODO_TOOLS + memory.MEMORY_TOOLS
 
+# One callback shape used everywhere events get emitted: (event_type, payload).
+# None (the default) means "no server attached" — behaves exactly as before
+# this refactor, purely additive so the single-agent CLI is unaffected.
+EventSink = Callable[[str, dict], None]
+
+
+def _emit(event_sink: "EventSink | None", event_type: str, payload: dict) -> None:
+    if event_sink is not None:
+        event_sink(event_type, payload)
+
 
 # --- Tool execution ---------------------------------------------------------
 
-def execute_tool(name: str, args: dict, model_key: str) -> str:
+def execute_tool(name: str, args: dict, model_key: str, todo_manager: TodoManager, mem: memory.Memory) -> str:
     if name == "run_bash_command":
         return run_bash_command(args["command"])
     if name in FILE_TOOL_HANDLERS:
         return FILE_TOOL_HANDLERS[name](args)
     if name in TODO_TOOL_HANDLERS:
-        return TODO_TOOL_HANDLERS[name](args)
+        return TODO_TOOL_HANDLERS[name](todo_manager, args)
     if name in memory.MEMORY_TOOL_HANDLERS:
-        return memory.MEMORY_TOOL_HANDLERS[name](model_key, args)
+        return memory.MEMORY_TOOL_HANDLERS[name](mem, model_key, args)
     return json.dumps({"error": f"Unknown tool: {name}"})
 
 
 # --- The agent loop ---------------------------------------------------------
 
-def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, interactive: bool = True) -> str:
+def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, interactive: bool = True,
+              task_id: str | None = None, event_sink: "EventSink | None" = None,
+              mem: "memory.Memory | None" = None, injection_queue=None) -> str:
     """interactive=False skips the confirm() gate — used when running as a
-    concurrent executor (Phase 5), since input() across threads is broken."""
+    concurrent executor (Phase 5), since input() across threads is broken.
+    task_id/event_sink are Phase 6 additions for the server: task_id tags
+    every emitted event (None for standalone CLI use, a real id when this
+    is one of dispatch.py's executors); event_sink is None by default so
+    nothing changes for the existing single-agent CLI. mem defaults to
+    memory.DEFAULT_MEMORY (the single-agent CLI's shared file) — dispatch.py
+    passes a session-scoped instance instead when running as an executor.
+    injection_queue (injection.InjectionQueue) lets a human's mid-flight
+    message reach this specific task_id — drained once per loop iteration,
+    right before the next provider.generate() call, never mid-tool-call."""
     provider = get_provider(model_key)
-    reset_todos()  # fresh plan state per task, not carried over from a prior run
+    todo_manager = TodoManager()  # own instance per run — never shared, no lock needed
+    mem = mem or memory.DEFAULT_MEMORY
 
     # This list IS the conversation. We own it, we grow it, we can compact
     # it — nothing about it depends on any provider retaining state.
@@ -119,12 +142,17 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, inter
     turn_count = 0
     final_text = ""
     while True:
+        if injection_queue is not None:
+            for msg in injection_queue.drain(task_id):
+                history.append(Turn(role="user", text=f"[Message from human]: {msg}"))
+                _emit(event_sink, "human_message_injected", {"task_id": task_id, "content": msg})
         response = provider.generate(history, ALL_TOOLS, SYSTEM_PROMPT)
 
         if response.text:
             final_text = response.text
             if verbose:
                 print(f"\n\033[94m{model_key}:\033[0m {response.text}")
+            _emit(event_sink, "agent_turn", {"task_id": task_id, "model_key": model_key, "text": response.text})
 
         if not response.tool_calls:
             break  # model is done: no more tools requested
@@ -138,6 +166,7 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, inter
                     "this harness is tuned for. Check the plan above for progress "
                     "made so far.\033[0m"
                 )
+            _emit(event_sink, "error", {"task_id": task_id, "message": f"hit the {MAX_ITERATIONS}-turn safety cap"})
             break
 
         # The model's turn (including its tool calls) must be appended
@@ -153,6 +182,7 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, inter
 
             if verbose and tc.name == "run_bash_command":
                 print(f"\033[93m$ {args.get('command', '')}\033[0m")
+            _emit(event_sink, "tool_call", {"task_id": task_id, "name": tc.name, "args": args})
 
             if tc.raw and tc.raw.get("args_parse_error"):
                 # Provider adapter couldn't parse this call's arguments as
@@ -167,7 +197,7 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, inter
                 })
             elif interactive and needs_confirmation(tc.name, args):
                 if confirm(tc.name, args):
-                    result = execute_tool(tc.name, args, model_key)
+                    result = execute_tool(tc.name, args, model_key, todo_manager, mem)
                 else:
                     print("\033[91mDenied.\033[0m")
                     result = json.dumps({
@@ -176,14 +206,17 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, inter
                                  "or try a different approach."
                     })
             else:
-                result = execute_tool(tc.name, args, model_key)
+                result = execute_tool(tc.name, args, model_key, todo_manager, mem)
 
             if verbose:
                 if tc.name == "todo_write":
-                    checklist = render_todos()
+                    checklist = todo_manager.render()
                     print(f"\033[96mPlan:\033[0m\n{checklist}")
                 else:
                     print(result[:500])
+            _emit(event_sink, "tool_result", {"task_id": task_id, "name": tc.name, "content": result})
+            if tc.name == "todo_write":
+                _emit(event_sink, "todo_updated", {"task_id": task_id, "checklist": todo_manager.render()})
 
             tool_results.append(ToolResult(call_id=tc.id, name=tc.name, content=result))
             executed_results.append({"name": tc.name, "content": result})
@@ -194,7 +227,7 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, inter
             # essential is lost (the todo list already externalizes progress).
             if verbose:
                 print(f"\033[95m[context] Compacting after {turn_count} turns — replacing history with a summary.\033[0m")
-            compact_text = build_compact_input(task, render_todos(), executed_results)
+            compact_text = build_compact_input(task, todo_manager.render(), executed_results)
             history = [Turn(role="user", text=compact_text)]
         else:
             history.append(Turn(role="user", tool_results=tool_results))

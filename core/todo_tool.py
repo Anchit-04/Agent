@@ -11,46 +11,53 @@ check progress against.
 The model is expected to pass the FULL todo list on every call, not a diff,
 and to keep exactly one item 'in_progress' at a time — that constraint is
 what keeps it working sequentially instead of context-switching.
+
+State used to be one module-level global (_todos). That was already wrong
+before multi-session was ever on the table: Phase 5's own concurrent
+executors call run_agent() on separate threads within the SAME session,
+and each one calling reset_todos()/todo_write() hit the identical global —
+a real data race that predates this fix, just never exercised by a test
+that had two executors both call todo_write() at the same time. Fixed by
+making todo state a per-instance object (TodoManager), same pattern
+ScopeScheduler/DependencyGraph already use — one instance per running
+agent, never shared, so no lock is needed here (unlike memory.py's file,
+which genuinely is shared across concurrent writers).
 """
 
 import json
 
-# Module-level state: the current plan for this run. Call reset_todos() at
-# the start of each run_agent() call so state doesn't leak between tasks.
-_todos = []
 
+class TodoManager:
+    """One instance per running agent (single-agent CLI run, one executor,
+    or the orchestrator's own plan) — never shared across threads, so this
+    needs no lock: only the one loop that owns an instance ever touches it."""
 
-def reset_todos() -> None:
-    global _todos
-    _todos = []
+    def __init__(self):
+        self._todos: list = []
 
+    def write(self, todos: list) -> str:
+        for t in todos:
+            if "content" not in t or "status" not in t:
+                return json.dumps({"error": "each todo needs 'content' and 'status'"})
+            if t["status"] not in ("pending", "in_progress", "completed"):
+                return json.dumps({"error": f"invalid status: {t['status']!r}"})
 
-def todo_write(todos: list) -> str:
-    """Replace the current plan with the given list."""
-    global _todos
-    for t in todos:
-        if "content" not in t or "status" not in t:
-            return json.dumps({"error": "each todo needs 'content' and 'status'"})
-        if t["status"] not in ("pending", "in_progress", "completed"):
-            return json.dumps({"error": f"invalid status: {t['status']!r}"})
+        in_progress_count = sum(1 for t in todos if t["status"] == "in_progress")
+        if in_progress_count > 1:
+            return json.dumps({
+                "error": f"{in_progress_count} items marked in_progress — keep exactly "
+                         "one at a time so you work sequentially."
+            })
 
-    in_progress_count = sum(1 for t in todos if t["status"] == "in_progress")
-    if in_progress_count > 1:
-        return json.dumps({
-            "error": f"{in_progress_count} items marked in_progress — keep exactly "
-                     "one at a time so you work sequentially."
-        })
+        self._todos = todos
+        return json.dumps({"success": True, "count": len(todos)})
 
-    _todos = todos
-    return json.dumps({"success": True, "count": len(todos)})
-
-
-def render_todos() -> str:
-    """Human-readable checklist for terminal display. Empty string if no plan yet."""
-    if not _todos:
-        return ""
-    icons = {"pending": "☐", "in_progress": "▶", "completed": "☑"}
-    return "\n".join(f"  {icons.get(t['status'], '?')} {t['content']}" for t in _todos)
+    def render(self) -> str:
+        """Human-readable checklist for terminal display. Empty string if no plan yet."""
+        if not self._todos:
+            return ""
+        icons = {"pending": "☐", "in_progress": "▶", "completed": "☑"}
+        return "\n".join(f"  {icons.get(t['status'], '?')} {t['content']}" for t in self._todos)
 
 
 TODO_TOOLS = [
@@ -93,5 +100,5 @@ TODO_TOOLS = [
 ]
 
 TODO_TOOL_HANDLERS = {
-    "todo_write": lambda args: todo_write(args["todos"]),
+    "todo_write": lambda manager, args: manager.write(args["todos"]),
 }
