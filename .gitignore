@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 
+# The build plan is kept local only — not published to the remote.
+PLAN.md
+
 # Go build artifacts — compiled per-platform, never source, never committed.
 *.exe
 *.exe~
