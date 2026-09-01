@@ -104,11 +104,14 @@ def execute_tool(name: str, args: dict, model_key: str, todo_manager: TodoManage
 
 def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, interactive: bool = True,
               task_id: str | None = None, event_sink: "EventSink | None" = None,
-              mem: "memory.Memory | None" = None, injection_queue=None) -> str:
+              mem: "memory.Memory | None" = None, injection_queue=None, keep_alive: bool = False) -> str:
     """interactive=False skips the confirm() gate — used by concurrent
     executors, since input() breaks across threads. task_id/event_sink/mem/
     injection_queue are the server hooks (all optional, all defaulted so the
-    plain CLI still works unchanged)."""
+    plain CLI still works unchanged). keep_alive=True is for a live top-level
+    chat session only — never set it for a delegated executor task, or it'll
+    block forever waiting for input nobody's going to send, deadlocking
+    whatever's waiting on this task via DependencyGraph.wait_for_dependencies()."""
     provider = get_provider(model_key)
     todo_manager = TodoManager()  # own instance per run — never shared, no lock needed
     mem = mem or memory.DEFAULT_MEMORY
@@ -132,6 +135,18 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, inter
             _emit(event_sink, "agent_turn", {"task_id": task_id, "model_key": model_key, "text": response.text})
 
         if not response.tool_calls:
+            if keep_alive and injection_queue is not None:
+                # Model has nothing more to do right now — that means "your
+                # turn," not "session over." Block here for the next message
+                # instead of ending; only close() (an explicit end-of-session
+                # signal) or a real disconnect-driven close should end this.
+                messages = injection_queue.wait_for_message(task_id)
+                if messages is None:
+                    break
+                for msg in messages:
+                    history.append(Turn(role="user", text=f"[Message from human]: {msg}"))
+                    _emit(event_sink, "human_message_injected", {"task_id": task_id, "content": msg})
+                continue
             break  # model is done: no more tools requested
 
         turn_count += 1
