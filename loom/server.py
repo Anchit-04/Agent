@@ -7,8 +7,10 @@ from dataclasses import dataclass, field, asdict
 
 import websockets
 
+import agent
 import orchestrator
 import memory
+from config import routing
 from injection import InjectionQueue
 from paths import PROJECT_ROOT
 
@@ -80,7 +82,12 @@ SESSIONS: dict[str, Session] = {}
 SESSIONS_LOCK = threading.Lock()
 
 
-def _start_session(task: str, model_key: str | None, loop: asyncio.AbstractEventLoop) -> Session:
+def _start_session(task: str, model_key: str | None, mode: str, loop: asyncio.AbstractEventLoop) -> Session:
+    """mode="agent" (default) runs a single agent with real bash/file tools —
+    a normal coding-harness session, one model, no delegation. mode=
+    "orchestrator" is the Phase 5 multi-agent path: plans and delegates,
+    never touches files/bash directly itself. Both emit the same event
+    shapes, so the rest of Session doesn't need to know which one is running."""
     session_id = str(uuid.uuid4())
     session = Session(session_id, task)
     session.loop = loop
@@ -91,11 +98,21 @@ def _start_session(task: str, model_key: str | None, loop: asyncio.AbstractEvent
 
     def run():
         try:
-            final = orchestrator.run_orchestrator(
-                task, verbose=False, model_key=model_key,
-                event_sink=session.handle_event, mem=mem,
-                injection_queue=session.injection_queue,
-            )
+            if mode == "orchestrator":
+                final = orchestrator.run_orchestrator(
+                    task, verbose=False, model_key=model_key,
+                    event_sink=session.handle_event, mem=mem,
+                    injection_queue=session.injection_queue,
+                )
+            else:
+                # No routing.pick_orchestrator() strong-tier requirement here —
+                # a single chatting agent works with whatever key is present.
+                chosen_model = model_key or routing.pick_executor()
+                final = agent.run_agent(
+                    task, verbose=False, model_key=chosen_model, interactive=False,
+                    task_id=None, event_sink=session.handle_event, mem=mem,
+                    injection_queue=session.injection_queue, keep_alive=True,
+                )
             with session._lock:
                 session.state.final_text = final
                 session.state.status = "done"
@@ -104,7 +121,9 @@ def _start_session(task: str, model_key: str | None, loop: asyncio.AbstractEvent
                 session.state.status = "failed"
                 session.state.final_text = str(e)
         session.persist()
-        session._broadcast("session_ended", {"task_id": None, "status": session.state.status})
+        session._broadcast("session_ended", {
+            "task_id": None, "status": session.state.status, "final_text": session.state.final_text,
+        })
 
     threading.Thread(target=run, daemon=True).start()
     return session
@@ -117,7 +136,9 @@ async def handler(ws) -> None:
         msg_type = msg.get("type")
 
         if msg_type == "start_session":
-            session = _start_session(msg["task"], msg.get("model_key"), asyncio.get_running_loop())
+            session = _start_session(
+                msg["task"], msg.get("model_key"), msg.get("mode", "agent"), asyncio.get_running_loop()
+            )
             session.clients.add(ws)
             attached = session
             await ws.send(json.dumps({"type": "session_started", "session_id": session.session_id}))
@@ -140,6 +161,18 @@ async def handler(ws) -> None:
                 continue
             session.injection_queue.push(msg.get("task_id"), msg["content"])
             await ws.send(json.dumps({"type": "human_message_queued", "session_id": session.session_id, "task_id": msg.get("task_id")}))
+
+        elif msg_type == "end_session":
+            # Explicit, deliberate end — never triggered by a disconnect.
+            # A session with nobody attached just sits blocked, waiting,
+            # for as long as this server process keeps running.
+            with SESSIONS_LOCK:
+                session = SESSIONS.get(msg.get("session_id"))
+            if session is None:
+                await ws.send(json.dumps({"type": "error", "message": f"unknown session_id {msg.get('session_id')!r}"}))
+                continue
+            session.injection_queue.close(msg.get("task_id"))
+            await ws.send(json.dumps({"type": "end_session_queued", "session_id": session.session_id}))
 
         else:
             await ws.send(json.dumps({"type": "error", "message": f"unknown message type {msg_type!r}"}))
