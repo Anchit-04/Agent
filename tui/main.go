@@ -1,15 +1,17 @@
-// tui is the terminal client — connects to loom/server.py over WebSocket
-// (not wired up yet, this is the rendering scaffold). Chat defaults to the
-// orchestrator's conversation; the card stack cycles discretely, not smoothly.
+// tui is the terminal client — connects to loom/server.py over WebSocket.
+// Chat defaults to the orchestrator's conversation; the card stack cycles
+// discretely, not smoothly.
 package main
 
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/coder/websocket"
 )
 
 type card struct {
@@ -27,6 +29,11 @@ type model struct {
 	input         textinput.Model
 	cardIndex     int
 	quitting      bool
+
+	conn         *websocket.Conn
+	sessionID    string
+	messages     []string
+	disconnected bool
 }
 
 func initialModel() model {
@@ -59,9 +66,46 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cardIndex = (m.cardIndex + 1) % len(cards)
 			return m, nil
 		case "enter":
-			m.input.Reset() // command parsing lands later — not designed yet
+			content := strings.TrimSpace(m.input.Value())
+			m.input.Reset()
+			if content == "" || m.disconnected {
+				return m, nil
+			}
+			m.messages = append(m.messages, "you: "+content)
+			if err := sendHumanMessage(m.conn, m.sessionID, nil, content); err != nil {
+				m.messages = append(m.messages, "[failed to send]: "+err.Error())
+			}
 			return m, nil
 		}
+
+	case agentTurnMsg:
+		m.messages = append(m.messages, fmt.Sprintf("%s: %s", msg.ModelKey, msg.Text))
+		return m, nil
+
+	case toolCallMsg:
+		m.messages = append(m.messages, fmt.Sprintf("→ %s(%v)", msg.Name, msg.Args))
+		return m, nil
+
+	case toolResultMsg:
+		m.messages = append(m.messages, "  "+truncate(msg.Content, 300))
+		return m, nil
+
+	case sessionEndedMsg:
+		if msg.Status == "failed" {
+			m.messages = append(m.messages, "[session failed]: "+msg.FinalText)
+		} else {
+			m.messages = append(m.messages, "[session ended]")
+		}
+		return m, nil
+
+	case serverErrorMsg:
+		m.messages = append(m.messages, "[error]: "+msg.Message)
+		return m, nil
+
+	case connectionLostMsg:
+		m.disconnected = true
+		m.messages = append(m.messages, "[disconnected]: "+msg.Err.Error())
+		return m, nil
 	}
 
 	var cmd tea.Cmd
@@ -79,11 +123,15 @@ func (m model) View() tea.View {
 		return v
 	}
 
+	chatContent := "(no messages yet)"
+	if len(m.messages) > 0 {
+		chatContent = strings.Join(m.messages, "\n\n")
+	}
 	chat := lipgloss.NewStyle().
 		Width(m.width-24).
 		Height(m.height-6).
 		Padding(1, 2).
-		Render("Chat window\n\n(orchestrator conversation streams here)")
+		Render(chatContent)
 
 	top := lipgloss.JoinHorizontal(lipgloss.Top, chat, renderCardStack(m.cardIndex, 18))
 
@@ -134,8 +182,37 @@ func abs(n int) int {
 	return n
 }
 
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + fmt.Sprintf("... [%d chars total]", len(s))
+}
+
 func main() {
-	p := tea.NewProgram(initialModel())
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr, `Usage: tui "<task>" [model_key]`)
+		os.Exit(1)
+	}
+	task := os.Args[1]
+	modelKey := "" // empty means "let the backend pick any available key"
+	if len(os.Args) > 2 {
+		modelKey = os.Args[2]
+	}
+
+	conn, sessionID, err := connect("ws://localhost:8765", task, modelKey, "agent")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "failed to connect:", err)
+		os.Exit(1)
+	}
+
+	m := initialModel()
+	m.conn = conn
+	m.sessionID = sessionID
+
+	p := tea.NewProgram(m)
+	go listen(conn, p)
+
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
