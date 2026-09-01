@@ -6,6 +6,7 @@ require (
 	charm.land/bubbles/v2 v2.2.0
 	charm.land/bubbletea/v2 v2.0.9
 	charm.land/lipgloss/v2 v2.0.6
+	github.com/coder/websocket v1.8.15
 )
 
 require (

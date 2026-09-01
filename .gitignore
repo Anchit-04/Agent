@@ -1,6 +1,7 @@
 .env
 __pycache__/
 *.pyc
+sessions/
 
 # The build plan is kept local only — not published to the remote.
 PLAN.md
