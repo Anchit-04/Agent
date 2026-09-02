@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"charm.land/bubbles/v2/textinput"
+	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/coder/websocket"
@@ -27,6 +28,7 @@ var cards = []card{
 type model struct {
 	width, height int
 	input         textinput.Model
+	chat          viewport.Model
 	cardIndex     int
 	quitting      bool
 
@@ -40,7 +42,24 @@ func initialModel() model {
 	ti := textinput.New()
 	ti.Focus()
 	ti.SetWidth(60)
-	return model{input: ti}
+
+	vp := viewport.New()
+	vp.SoftWrap = true // wrap long lines instead of forcing horizontal scroll
+	vp.SetContent("(waiting for the agent…)")
+
+	return model{input: ti, chat: vp}
+}
+
+// pushMessage appends a line to the transcript and refreshes the chat
+// viewport. It only auto-scrolls to the bottom if you were already there —
+// so scrolling up to read history isn't yanked back down by new events.
+func (m *model) pushMessage(line string) {
+	wasAtBottom := m.chat.AtBottom()
+	m.messages = append(m.messages, line)
+	m.chat.SetContent(strings.Join(m.messages, "\n\n"))
+	if wasAtBottom {
+		m.chat.GotoBottom()
+	}
 }
 
 func (m model) Init() tea.Cmd {
@@ -52,6 +71,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.input.SetWidth(m.width - 8)
+		// chat box is Width(m.width-24) Height(m.height-6) with Padding(1,2),
+		// so the inner content area is 4 narrower and 2 shorter.
+		cw, ch := m.width-28, m.height-8
+		if cw < 1 {
+			cw = 1
+		}
+		if ch < 1 {
+			ch = 1
+		}
+		m.chat.SetWidth(cw)
+		m.chat.SetHeight(ch)
 		return m, nil
 
 	case tea.KeyPressMsg:
@@ -65,46 +95,58 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "down":
 			m.cardIndex = (m.cardIndex + 1) % len(cards)
 			return m, nil
+		case "pgup":
+			m.chat.PageUp()
+			return m, nil
+		case "pgdown":
+			m.chat.PageDown()
+			return m, nil
+		case "shift+up":
+			m.chat.ScrollUp(1)
+			return m, nil
+		case "shift+down":
+			m.chat.ScrollDown(1)
+			return m, nil
 		case "enter":
 			content := strings.TrimSpace(m.input.Value())
 			m.input.Reset()
 			if content == "" || m.disconnected {
 				return m, nil
 			}
-			m.messages = append(m.messages, "you: "+content)
+			m.pushMessage("you: " + content)
 			if err := sendHumanMessage(m.conn, m.sessionID, nil, content); err != nil {
-				m.messages = append(m.messages, "[failed to send]: "+err.Error())
+				m.pushMessage("[failed to send]: " + err.Error())
 			}
 			return m, nil
 		}
 
 	case agentTurnMsg:
-		m.messages = append(m.messages, fmt.Sprintf("%s: %s", msg.ModelKey, msg.Text))
+		m.pushMessage(fmt.Sprintf("%s: %s", msg.ModelKey, msg.Text))
 		return m, nil
 
 	case toolCallMsg:
-		m.messages = append(m.messages, fmt.Sprintf("→ %s(%v)", msg.Name, msg.Args))
+		m.pushMessage(fmt.Sprintf("→ %s(%v)", msg.Name, msg.Args))
 		return m, nil
 
 	case toolResultMsg:
-		m.messages = append(m.messages, "  "+truncate(msg.Content, 300))
+		m.pushMessage("  " + truncate(msg.Content, 300))
 		return m, nil
 
 	case sessionEndedMsg:
 		if msg.Status == "failed" {
-			m.messages = append(m.messages, "[session failed]: "+msg.FinalText)
+			m.pushMessage("[session failed]: " + msg.FinalText)
 		} else {
-			m.messages = append(m.messages, "[session ended]")
+			m.pushMessage("[session ended]")
 		}
 		return m, nil
 
 	case serverErrorMsg:
-		m.messages = append(m.messages, "[error]: "+msg.Message)
+		m.pushMessage("[error]: " + msg.Message)
 		return m, nil
 
 	case connectionLostMsg:
 		m.disconnected = true
-		m.messages = append(m.messages, "[disconnected]: "+msg.Err.Error())
+		m.pushMessage("[disconnected]: " + msg.Err.Error())
 		return m, nil
 	}
 
@@ -123,15 +165,11 @@ func (m model) View() tea.View {
 		return v
 	}
 
-	chatContent := "(no messages yet)"
-	if len(m.messages) > 0 {
-		chatContent = strings.Join(m.messages, "\n\n")
-	}
 	chat := lipgloss.NewStyle().
 		Width(m.width-24).
 		Height(m.height-6).
 		Padding(1, 2).
-		Render(chatContent)
+		Render(m.chat.View())
 
 	top := lipgloss.JoinHorizontal(lipgloss.Top, chat, renderCardStack(m.cardIndex, 18))
 
