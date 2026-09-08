@@ -16,7 +16,7 @@ from .openai_compatible import OpenAICompatibleProvider
 MODEL_REGISTRY = {
     "gemini-flash": {
         "provider": GeminiProvider,
-        "model_id": "gemini-3.6-flash",
+        "model_id": "gemini-3.8-flash",  # was 3.6-flash — that id started returning 503 "high demand"; 3.8 is current-gen and on the same key
         "env_key": "GEMINI_API_KEY",
         "tier": "cheap",
     },
@@ -38,6 +38,39 @@ MODEL_REGISTRY = {
         "model_id": "kimi-k2-0711-preview",
         "env_key": "MOONSHOT_API_KEY",
         "base_url": "https://api.moonshot.ai/v1",
+        "tier": "cheap",
+    },
+    # OpenRouter — one key, many models. These point at :free variants
+    # (rate-limited: ~20 req/min, ~50 req/day until $10 lifetime spend).
+    # The :free roster churns — models get pulled without notice, and a
+    # pulled id fails at call time, not at startup, since vault.is_present()
+    # only checks the env var. Re-verify with GET /api/v1/models, filtering
+    # pricing==0 AND 'tools' in supported_parameters. Free-tier models that
+    # merely *accept* a tools array often won't actually emit tool calls —
+    # both entries below were confirmed to emit a real one, not just chat.
+    "north-code": {
+        "provider": OpenAICompatibleProvider,
+        "model_id": "cohere/north-mini-code:free",
+        "env_key": "OPENROUTER_API_KEY",
+        "base_url": "https://openrouter.ai/api/v1",
+        "tier": "cheap",
+    },
+    # Fastest verified free model — ~1.7s to first tool call, which is what
+    # makes a live agent loop feel responsive rather than hung.
+    "dots-note": {
+        "provider": OpenAICompatibleProvider,
+        "model_id": "dots-studio/dots-3-note-preview:free",
+        "env_key": "OPENROUTER_API_KEY",
+        "base_url": "https://openrouter.ai/api/v1",
+        "tier": "cheap",
+    },
+    # 1M context — the one to reach for when a task reads a lot of files.
+    # ~6.5s/call. Its 550b sibling also tool-calls but takes ~39s, unusable here.
+    "nemotron-lightning": {
+        "provider": OpenAICompatibleProvider,
+        "model_id": "nvidia/nemotron-3.5-lightning:free",
+        "env_key": "OPENROUTER_API_KEY",
+        "base_url": "https://openrouter.ai/api/v1",
         "tier": "cheap",
     },
 }
