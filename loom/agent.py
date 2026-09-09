@@ -25,7 +25,23 @@ MODEL_KEY = "gemini-flash"          # default entry in providers/config.py's MOD
 # WORKDIR is set in three separate places right now (not here) —
 # sandbox_client.py and file_tools.py each have their own. Should centralize.
 
-SYSTEM_PROMPT = """You are a coding agent. You have access to:
+# Prepended to every system prompt, orchestrator included. The model key is
+# interpolated rather than hardcoded so the agent can answer "what are you
+# running on?" accurately, while still presenting as Fox by default — the
+# underlying vendor name should never appear in an introduction.
+IDENTITY = """You are Fox, a coding agent.
+
+- Introduce yourself as Fox. Never identify as the underlying model, and
+  never as an assistant built by whoever trained that model.
+- You are currently running on the model '{model_key}'. Say so only if the
+  user actually asks which model, engine, or provider you're using. Don't
+  volunteer it, and never put it in an introduction.
+- Introduce yourself once, when greeted or asked who you are — then get on
+  with the work. Do not re-introduce yourself at the start of every reply.
+
+"""
+
+SYSTEM_PROMPT_BASE = """You have access to:
 - read_file, write_file, edit_file, search_files — dedicated tools for inspecting
   and modifying code. Prefer these over bash for file operations: they're safer
   and work identically on every OS.
@@ -49,6 +65,12 @@ Rules:
   declaring the task done.
 - When you are finished, respond with plain text and no further tool calls.
 """
+
+
+def build_system_prompt(model_key: str) -> str:
+    """Fox identity + the tool/behaviour rules. Built per run rather than
+    stored as a constant, since the identity block names the live model."""
+    return IDENTITY.format(model_key=model_key) + SYSTEM_PROMPT_BASE
 
 # --- Tool definitions --------------------------------------------------------
 # Plain JSON-schema dicts — each provider adapter converts these to its own
@@ -113,6 +135,7 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, inter
     block forever waiting for input nobody's going to send, deadlocking
     whatever's waiting on this task via DependencyGraph.wait_for_dependencies()."""
     provider = get_provider(model_key)
+    system_prompt = build_system_prompt(model_key)  # model_key is fixed for this run
     todo_manager = TodoManager()  # own instance per run — never shared, no lock needed
     mem = mem or memory.DEFAULT_MEMORY
 
@@ -126,7 +149,7 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, inter
             for msg in injection_queue.drain(task_id):
                 history.append(Turn(role="user", text=f"[Message from human]: {msg}"))
                 _emit(event_sink, "human_message_injected", {"task_id": task_id, "content": msg})
-        response = provider.generate(history, ALL_TOOLS, SYSTEM_PROMPT)
+        response = provider.generate(history, ALL_TOOLS, system_prompt)
 
         if response.text:
             final_text = response.text

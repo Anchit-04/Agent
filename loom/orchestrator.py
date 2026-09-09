@@ -7,7 +7,7 @@ from config import routing, preferences
 import memory
 import dispatch
 from injection import InjectionQueue
-from agent import EventSink, _emit
+from agent import EventSink, _emit, IDENTITY
 from context import MAX_ITERATIONS, COMPACT_EVERY, build_compact_input
 from providers import get_provider, Turn, ToolResult
 from tools.todo_tool import TODO_TOOLS, TODO_TOOL_HANDLERS, TodoManager
@@ -80,7 +80,8 @@ def run_orchestrator(task: str, verbose: bool = True, model_key: str | None = No
             history.append(Turn(role="user", text=f"[Message from human]: {msg}"))
             _emit(event_sink, "human_message_injected", {"task_id": None, "content": msg})
         system_prompt = (
-            ORCHESTRATOR_SYSTEM_PROMPT_BASE
+            IDENTITY.format(model_key=model_key)
+            + ORCHESTRATOR_SYSTEM_PROMPT_BASE
             + "\n## Executor specialties\n" + preferences.render_for_prompt()
             + "\n## Current shared memory index\n" + mem.read_index()
         )

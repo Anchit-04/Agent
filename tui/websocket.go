@@ -47,6 +47,20 @@ type serverErrorMsg struct {
 	Message string `json:"message"`
 }
 
+// vaultEntry mirrors config/vault.py's VaultEntry dataclass. Validated is a
+// pointer because the server sends null for "never checked this session" —
+// which is meaningfully different from "checked and failed".
+type vaultEntry struct {
+	ModelKey  string `json:"model_key"`
+	Tier      string `json:"tier"`
+	Present   bool   `json:"present"`
+	Validated *bool  `json:"validated"`
+}
+
+type modelsMsg struct {
+	Models []vaultEntry `json:"models"`
+}
+
 // connectionLostMsg is ours, not the server's — listen() synthesizes it
 // when the read itself fails, there's no wire format for it.
 type connectionLostMsg struct {
@@ -118,12 +132,38 @@ func listen(conn *websocket.Conn, p *tea.Program) {
 			var m sessionEndedMsg
 			json.Unmarshal(data, &m)
 			p.Send(m)
+		case "models":
+			var m modelsMsg
+			json.Unmarshal(data, &m)
+			p.Send(m)
 		case "error":
 			var m serverErrorMsg
 			json.Unmarshal(data, &m)
 			p.Send(m)
 		}
 	}
+}
+
+// requestModels asks the server for the vault contents. validate=true makes
+// the server actually authenticate each key against its provider, which is a
+// real network round-trip per model — noticeably slow, so it's opt-in.
+func requestModels(conn *websocket.Conn, validate bool) error {
+	return wsjson.Write(context.Background(), conn, map[string]any{
+		"type": "list_models", "validate": validate,
+	})
+}
+
+// setModelKey saves an API key for one model. The server writes it into .env
+// and re-validates against the real provider, then replies with a fresh
+// "models" payload — so the caller never needs a separate refresh.
+//
+// The key crosses the socket in plaintext. That's acceptable only because
+// server.py binds localhost; it would not be if the backend ever moved off
+// the machine (phase 7), which is where real key storage has to land.
+func setModelKey(conn *websocket.Conn, modelKey, value string) error {
+	return wsjson.Write(context.Background(), conn, map[string]any{
+		"type": "set_model_key", "model_key": modelKey, "value": value,
+	})
 }
 
 // sendHumanMessage writes a chat message out on the same connection listen()

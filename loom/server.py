@@ -10,7 +10,7 @@ import websockets
 import agent
 import orchestrator
 import memory
-from config import routing
+from config import routing, vault
 from injection import InjectionQueue
 from paths import PROJECT_ROOT
 
@@ -129,6 +129,16 @@ def _start_session(task: str, model_key: str | None, mode: str, loop: asyncio.Ab
     return session
 
 
+def _validate_all_keys() -> None:
+    """Force a real auth check against every provider that has a key set.
+    Blocking network I/O — always call this via asyncio.to_thread, never
+    straight from the handler, or one slow provider stalls every session
+    sharing this event loop."""
+    for entry in vault.list_models():
+        if entry.present:
+            vault.validate_key(entry.model_key, force=True)
+
+
 async def handler(ws) -> None:
     attached: Session | None = None
     async for raw in ws:
@@ -173,6 +183,37 @@ async def handler(ws) -> None:
                 continue
             session.injection_queue.close(msg.get("task_id"))
             await ws.send(json.dumps({"type": "end_session_queued", "session_id": session.session_id}))
+
+        elif msg_type == "list_models":
+            # The vault is process-global, not per-session, so this is
+            # deliberately answerable without an attached session — the TUI
+            # can open the Vault panel before any agent is running.
+            # validate=True re-authenticates every present key for real;
+            # without it, `validated` is whatever the per-session cache holds
+            # (null = never checked), which is cheap but not proof.
+            if msg.get("validate"):
+                await asyncio.to_thread(_validate_all_keys)
+            await ws.send(json.dumps({
+                "type": "models",
+                "models": [asdict(e) for e in vault.list_models()],
+            }))
+
+        elif msg_type == "set_model_key":
+            # vault.set_key writes .env via python-dotenv (preserving the rest
+            # of the file), updates os.environ so it's live without a restart,
+            # and drops any cached validation for that key. We then validate
+            # for real so the UI can say "saved and works" rather than just
+            # "saved" — the distinction that keeps costing us debug cycles.
+            try:
+                vault.set_key(msg["model_key"], msg["value"])
+                await asyncio.to_thread(vault.validate_key, msg["model_key"], True)
+            except Exception as e:
+                await ws.send(json.dumps({"type": "error", "message": f"could not save key: {e}"}))
+                continue
+            await ws.send(json.dumps({
+                "type": "models",
+                "models": [asdict(e) for e in vault.list_models()],
+            }))
 
         else:
             await ws.send(json.dumps({"type": "error", "message": f"unknown message type {msg_type!r}"}))

@@ -49,8 +49,18 @@ class GeminiProvider(Provider):
         return ProviderResponse(text=response.text, tool_calls=tool_calls)
 
     def _generate_with_retry(self, contents, config):
-        """Retries on 429s — the free tier's rate limit gets hit often enough
-        (one request per tool round-trip) that this is expected, not a bug."""
+        """Retries two distinct transient failures:
+
+        429/quota — the free tier's rate limit, hit often enough (one request
+        per tool round-trip) that it's expected, not a bug. Gemini usually
+        tells us how long to wait, so honour that hint when present.
+
+        503/UNAVAILABLE — "this model is currently experiencing high demand".
+        Server-side capacity, nothing to do with our request, and it clears in
+        seconds. Previously this fell straight through to `raise` and killed
+        the whole session on a blip; there's no retry hint, so back off
+        exponentially.
+        """
         for attempt in range(MAX_RETRIES):
             try:
                 return self._client.models.generate_content(
@@ -58,15 +68,22 @@ class GeminiProvider(Provider):
                 )
             except Exception as e:
                 msg = str(e)
-                if "429" not in msg and "quota" not in msg.lower():
-                    raise  # not a rate-limit error, don't swallow it
+                rate_limited = "429" in msg or "quota" in msg.lower()
+                unavailable = "503" in msg or "UNAVAILABLE" in msg
+                if not (rate_limited or unavailable):
+                    raise  # a real error — don't swallow it
 
-                match = re.search(r"retry in ([\d.]+)s", msg)
-                wait = float(match.group(1)) + 1 if match else (2 ** attempt)
+                if rate_limited:
+                    match = re.search(r"retry in ([\d.]+)s", msg)
+                    wait = float(match.group(1)) + 1 if match else (2 ** attempt)
+                    reason = "Rate limited"
+                else:
+                    wait = 2 ** attempt
+                    reason = "Model unavailable (503)"
 
                 if attempt == MAX_RETRIES - 1:
                     raise
-                print(f"\033[91mRate limited, waiting {wait:.0f}s (attempt {attempt + 1}/{MAX_RETRIES})...\033[0m")
+                print(f"\033[91m{reason}, waiting {wait:.0f}s (attempt {attempt + 1}/{MAX_RETRIES})...\033[0m")
                 time.sleep(wait)
 
 
