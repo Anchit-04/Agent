@@ -68,7 +68,7 @@ def run_orchestrator(task: str, verbose: bool = True, model_key: str | None = No
     model_key = model_key or routing.pick_orchestrator()
     provider = get_provider(model_key)
     todo_manager = TodoManager()  # own instance per session — never shared, no lock needed
-    mem = mem or memory.DEFAULT_MEMORY
+    mem = mem or memory.default_memory()
     injection_queue = injection_queue or InjectionQueue()
     scheduler = dispatch.ScopeScheduler()
 

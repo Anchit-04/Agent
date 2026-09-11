@@ -18,9 +18,7 @@ import re
 import json
 from pathlib import Path
 
-from paths import PROJECT_ROOT
-
-WORKDIR = PROJECT_ROOT  # single source of truth — see paths.py
+import paths
 
 # Directories we never want to walk into during search_files — noisy and
 # almost never what the agent actually wants to see.
@@ -28,14 +26,22 @@ SEARCH_IGNORE_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "d
 
 
 class PathTraversalError(Exception):
-    """Raised when a requested path resolves outside the WORKDIR sandbox."""
+    """Raised when a requested path resolves outside the workspace."""
 
 
 def _resolve(path: str) -> Path:
-    """Resolve `path` relative to WORKDIR and verify it stays inside WORKDIR.
+    """Resolve `path` against the workspace and verify it stays inside it.
     Plain path-joining trusted the input — a '..' or an absolute path could
-    escape the sandbox — so this resolves to absolute first, then checks containment."""
-    root = Path(WORKDIR).resolve()
+    escape — so this resolves to absolute first, then checks containment.
+
+    This is a containment boundary for the file tools only. run_bash_command
+    is NOT bounded by it: sandboxd limits memory and process lifetime, not
+    filesystem access, so a shell command can reach anywhere the user can.
+
+    The root is read per call, never cached at module level — the workspace is
+    chosen at startup, after this module is imported.
+    """
+    root = paths.workspace()
     candidate = (root / path).resolve()
     try:
         candidate.relative_to(root)

@@ -3,7 +3,7 @@ Shared memory: one markdown file all agents in a session read from and write to.
 
 Used to be a module-level global — fine for one session, but two sessions
 would've silently shared the same log. Now a per-instance class, one Memory
-per session; DEFAULT_MEMORY is only for the standalone single-agent CLI.
+per session; default_memory() is only for the standalone single-agent CLI.
 """
 
 import itertools
@@ -11,7 +11,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from paths import PROJECT_ROOT
+import paths
 
 
 def _now() -> str:
@@ -60,7 +60,21 @@ class Memory:
         return "\n".join(lines[start:end]).strip()
 
 
-DEFAULT_MEMORY = Memory(PROJECT_ROOT / "SHARED_MEMORY.md")  # standalone single-agent CLI only
+_default: Memory | None = None
+
+
+def default_memory() -> Memory:
+    """Fallback Memory for callers that didn't bring their own — the standalone
+    CLI, mostly; a real session always passes its own instance.
+
+    Built on first use rather than at import, because the workspace isn't
+    chosen until startup and this log lives inside it. Cached afterwards so
+    one process keeps one log per run.
+    """
+    global _default
+    if _default is None:
+        _default = Memory(paths.shared_memory_file())
+    return _default
 
 
 MEMORY_WRITE_TOOL = {

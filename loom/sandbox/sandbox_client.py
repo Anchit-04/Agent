@@ -17,9 +17,8 @@ import subprocess
 import threading
 from pathlib import Path
 
-from paths import PROJECT_ROOT
+import paths
 
-WORKDIR = PROJECT_ROOT  # commands run with this as their working directory — see paths.py
 MAX_OUTPUT_CHARS = 8000  # context-budget cap, not a sandboxing concern — sandboxd itself doesn't truncate
 
 # Comfortably above sandboxd's own 30s per-command timeout (main.go's
@@ -39,7 +38,10 @@ def _start() -> subprocess.Popen:
         )
     proc = subprocess.Popen(
         [str(_SANDBOXD_PATH)],
-        cwd=WORKDIR,
+        # Starting directory for every command, not a boundary — a command is
+        # free to cd out of it. Read per call, since sandboxd is started lazily
+        # and the workspace is chosen at startup.
+        cwd=paths.workspace(),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,

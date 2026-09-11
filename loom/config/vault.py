@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import dotenv
 
-from paths import PROJECT_ROOT
+from paths import FOX_HOME
 from providers.config import MODEL_REGISTRY, get_provider, get_tier
 
 
@@ -42,7 +42,7 @@ def set_key(model_key: str, value: str) -> None:
     if model_key not in MODEL_REGISTRY:
         raise VaultError(f"Unknown model key {model_key!r}. Known: {sorted(MODEL_REGISTRY)}")
     env_var = MODEL_REGISTRY[model_key]["env_key"]
-    dotenv.set_key(str(PROJECT_ROOT / ".env"), env_var, value)
+    dotenv.set_key(str(FOX_HOME / ".env"), env_var, value)
     os.environ[env_var] = value
     _validated_cache.pop(model_key, None)
 

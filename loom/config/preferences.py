@@ -3,9 +3,11 @@
 import json
 import threading
 
-from paths import PROJECT_ROOT
+from paths import FOX_HOME
 
-PREFERENCES_FILE = PROJECT_ROOT / "model_preferences.json"
+# FOX_HOME, not the workspace: these preferences describe Fox's own
+# models and should follow the installation across projects.
+PREFERENCES_FILE = FOX_HOME / "model_preferences.json"
 
 _lock = threading.Lock()
 

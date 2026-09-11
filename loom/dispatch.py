@@ -5,7 +5,7 @@ import time
 
 from config import routing
 import memory
-from paths import PROJECT_ROOT
+import paths
 from agent import run_agent, EventSink, _emit
 from providers import ToolResult
 
@@ -15,7 +15,9 @@ MAX_EXECUTOR_WAIT_SECONDS = 600
 
 
 def _normalize(path: str) -> str:
-    return str((PROJECT_ROOT / path).resolve())
+    """Scope paths are declared relative to the workspace, so two executors
+    naming the same file always collide on the same lock key."""
+    return str((paths.workspace() / path).resolve())
 
 
 def _check_no_cycles(deps: dict[str, set[str]]) -> None:
@@ -127,10 +129,10 @@ def run_executor_task(scheduler: ScopeScheduler, graph: DependencyGraph, task_id
 def execute_delegate_tasks(calls: list, scheduler: ScopeScheduler, event_sink: "EventSink | None" = None,
                             mem: "memory.Memory | None" = None, injection_queue=None) -> list[ToolResult]:
     """All delegate_task calls from one orchestrator turn, run as a batch of threads.
-    mem defaults to memory.DEFAULT_MEMORY if not given (standalone use) —
+    mem defaults to memory.default_memory() if not given (standalone use) —
     a real session always passes its own instance so every executor it
     spawns shares that session's log, not the global default."""
-    mem = mem or memory.DEFAULT_MEMORY
+    mem = mem or memory.default_memory()
     batch_ids = {tc.id for tc in calls}
     deps = {tc.id: set(tc.args.get("depends_on", [])) & batch_ids for tc in calls}
     external = {tc.id: set(tc.args.get("depends_on", [])) - batch_ids for tc in calls}

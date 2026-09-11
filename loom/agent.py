@@ -14,7 +14,9 @@ from typing import Callable
 
 from tools.file_tools import FILE_TOOLS, FILE_TOOL_HANDLERS
 from tools.todo_tool import TODO_TOOLS, TODO_TOOL_HANDLERS, TodoManager
-from permissions import needs_confirmation, confirm
+import paths
+import permissions
+from approval import CLIApprover, DenyApprover
 from context import MAX_ITERATIONS, COMPACT_EVERY, build_compact_input
 from providers import get_provider, Turn, ToolResult
 from sandbox.sandbox_client import run_bash_command
@@ -126,18 +128,29 @@ def execute_tool(name: str, args: dict, model_key: str, todo_manager: TodoManage
 
 def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, interactive: bool = True,
               task_id: str | None = None, event_sink: "EventSink | None" = None,
-              mem: "memory.Memory | None" = None, injection_queue=None, keep_alive: bool = False) -> str:
-    """interactive=False skips the confirm() gate — used by concurrent
-    executors, since input() breaks across threads. task_id/event_sink/mem/
-    injection_queue are the server hooks (all optional, all defaulted so the
-    plain CLI still works unchanged). keep_alive=True is for a live top-level
-    chat session only — never set it for a delegated executor task, or it'll
-    block forever waiting for input nobody's going to send, deadlocking
-    whatever's waiting on this task via DependencyGraph.wait_for_dependencies()."""
+              mem: "memory.Memory | None" = None, injection_queue=None, keep_alive: bool = False,
+              mode: str = permissions.WORKSPACE_WRITE, approver=None) -> str:
+    """mode is the sandbox axis (read-only / workspace-write / full-access);
+    `approver` is the approval axis — who gets asked when policy says ASK.
+    They're independent on purpose: see permissions.py.
+
+    interactive only picks the default approver now (CLI prompt vs refuse).
+    It no longer switches the permission check off — passing interactive=False
+    used to bypass permissions entirely, which is how a server session could
+    write files with nobody consulted. Callers with a real route to a human
+    (the server) pass an ApprovalGate explicitly.
+
+    task_id/event_sink/mem/injection_queue are the server hooks (all optional,
+    all defaulted so the plain CLI still works unchanged). keep_alive=True is
+    for a live top-level chat session only — never set it for a delegated
+    executor task, or it'll block forever waiting for input nobody's going to
+    send, deadlocking whatever's waiting on this task via
+    DependencyGraph.wait_for_dependencies()."""
     provider = get_provider(model_key)
+    approver = approver or (CLIApprover() if interactive else DenyApprover())
     system_prompt = build_system_prompt(model_key)  # model_key is fixed for this run
     todo_manager = TodoManager()  # own instance per run — never shared, no lock needed
-    mem = mem or memory.DEFAULT_MEMORY
+    mem = mem or memory.default_memory()
 
     # This list IS the conversation — resent in full every call.
     history = [Turn(role="user", text=task)]
@@ -205,18 +218,32 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, inter
                              f"Raw arguments received: {raw_args[:300]!r}. "
                              "Retry the call with valid JSON arguments."
                 })
-            elif interactive and needs_confirmation(tc.name, args):
-                if confirm(tc.name, args):
+            else:
+                decision = permissions.classify(tc.name, args, mode)
+                if decision.action == permissions.ALLOW:
+                    result = execute_tool(tc.name, args, model_key, todo_manager, mem)
+                elif decision.action == permissions.DENY:
+                    # Refused by the session's mode, not by a person — say so,
+                    # so the model stops rather than re-asking a locked door.
+                    _emit(event_sink, "tool_denied", {"task_id": task_id, "name": tc.name,
+                                                      "reason": decision.reason})
+                    result = json.dumps({
+                        "error": f"Refused: {decision.reason}. This session's permission "
+                                 "mode forbids it — don't retry, and don't work around it. "
+                                 "Tell the user what you needed and why."
+                    })
+                elif approver.approve(tc.name, args, decision.reason):
                     result = execute_tool(tc.name, args, model_key, todo_manager, mem)
                 else:
-                    print("\033[91mDenied.\033[0m")
+                    if verbose:
+                        print("\033[91mDenied.\033[0m")
+                    _emit(event_sink, "tool_denied", {"task_id": task_id, "name": tc.name,
+                                                      "reason": "denied by user"})
                     result = json.dumps({
                         "error": "User denied this action. Do not retry it as-is — "
                                  "explain what you were trying to do and ask how to proceed, "
                                  "or try a different approach."
                     })
-            else:
-                result = execute_tool(tc.name, args, model_key, todo_manager, mem)
 
             if verbose:
                 if tc.name == "todo_write":
@@ -245,8 +272,26 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, inter
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python agent.py '<task description>' [model_key]")
-        sys.exit(1)
-    key = sys.argv[2] if len(sys.argv) > 2 else MODEL_KEY
-    run_agent(sys.argv[1], model_key=key)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run one Fox agent from the terminal.")
+    parser.add_argument("task", help="What the agent should do.")
+    parser.add_argument("model_key", nargs="?", default=MODEL_KEY,
+                        help=f"Model registry key (default: {MODEL_KEY}).")
+    parser.add_argument("--workspace", default=None,
+                        help="Directory the agent may read and write. Defaults to the "
+                             "current directory.")
+    parser.add_argument("--allow-unsafe-workspace", action="store_true",
+                        help="Permit a drive root or your home directory as the workspace.")
+    parser.add_argument("--mode", default=permissions.WORKSPACE_WRITE, choices=permissions.MODES,
+                        help="Permission mode (default: workspace-write).")
+    args = parser.parse_args()
+
+    try:
+        ws_root = paths.set_workspace(args.workspace or paths.workspace(),
+                                      allow_unsafe=args.allow_unsafe_workspace)
+    except paths.WorkspaceError as e:
+        raise SystemExit(f"error: {e}")
+
+    print(f"\033[90mworkspace: {ws_root}\033[0m")
+    run_agent(args.task, model_key=args.model_key, mode=args.mode)

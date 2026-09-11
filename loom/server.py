@@ -12,9 +12,12 @@ import orchestrator
 import memory
 from config import routing, vault
 from injection import InjectionQueue
-from paths import PROJECT_ROOT
+import paths
+from paths import FOX_HOME
 
-SESSIONS_DIR = PROJECT_ROOT / "sessions"
+# FOX_HOME: session transcripts are Fox's own record, not project files,
+# and session ids are unique so one directory serves every workspace.
+SESSIONS_DIR = FOX_HOME / "sessions"
 SESSIONS_DIR.mkdir(exist_ok=True)
 
 
@@ -225,7 +228,30 @@ async def handler(ws) -> None:
 async def main(host: str = "localhost", port: int = 8765) -> None:
     async with websockets.serve(handler, host, port):
         print(f"server.py listening on ws://{host}:{port}")
-        await asyncio.Future()  
+        await asyncio.Future()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Fox session server.")
+    parser.add_argument("--workspace", default=None,
+                        help="Directory the agent may read and write. Defaults to the "
+                             "current directory.")
+    parser.add_argument("--allow-unsafe-workspace", action="store_true",
+                        help="Permit a drive root or your home directory as the workspace.")
+    parser.add_argument("--host", default="localhost")
+    parser.add_argument("--port", type=int, default=8765)
+    args = parser.parse_args()
+
+    try:
+        ws_root = paths.set_workspace(args.workspace or paths.workspace(),
+                                      allow_unsafe=args.allow_unsafe_workspace)
+    except paths.WorkspaceError as e:
+        raise SystemExit(f"error: {e}")
+
+    # Printed prominently because it's inferred from cwd when not passed, and
+    # launching from the wrong directory is otherwise invisible until the agent
+    # writes somewhere surprising.
+    print(f"workspace: {ws_root}")
+    print(f"fox home:  {paths.FOX_HOME}")
+    asyncio.run(main(args.host, args.port))
