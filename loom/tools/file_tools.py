@@ -16,6 +16,7 @@ your agent loop alongside the existing bash tool.
 import os
 import re
 import json
+import threading
 from pathlib import Path
 
 import paths
@@ -29,10 +30,42 @@ class PathTraversalError(Exception):
     """Raised when a requested path resolves outside the workspace."""
 
 
+# Paths a human has explicitly approved this agent from reaching, despite being
+# outside the workspace. Thread-local on purpose: one agent loop is one thread
+# (approve() blocks the same thread that then runs the tool), so each executor
+# gets its own set and no approval ever leaks into another session. A module
+# global would be shared by every session in the server process.
+_approved = threading.local()
+
+
+def _approved_paths() -> set[str]:
+    if not hasattr(_approved, "paths"):
+        _approved.paths = set()
+    return _approved.paths
+
+
+def allow_path(path: str) -> None:
+    """Grant this thread access to one path outside the workspace. Called by the
+    agent loop only after a human approved that specific call, so consent is
+    per-path and per-session, never a blanket lifting of containment.
+
+    Stored resolved, so the grant can't be reused via a different spelling of a
+    different file ('../x' from elsewhere) — only the exact target it was for.
+    """
+    _approved_paths().add(str((paths.workspace() / path).resolve()))
+
+
+def clear_approved_paths() -> None:
+    """Drop this thread's grants. Called when an agent run ends, so a pooled or
+    reused thread never inherits the last run's approvals."""
+    _approved_paths().clear()
+
+
 def _resolve(path: str) -> Path:
-    """Resolve `path` against the workspace and verify it stays inside it.
-    Plain path-joining trusted the input — a '..' or an absolute path could
-    escape — so this resolves to absolute first, then checks containment.
+    """Resolve `path` against the workspace and verify it stays inside it —
+    unless a human explicitly approved this exact path. Plain path-joining
+    trusted the input — a '..' or an absolute path could escape — so this
+    resolves to absolute first, then checks containment.
 
     This is a containment boundary for the file tools only. run_bash_command
     is NOT bounded by it: sandboxd limits memory and process lifetime, not
@@ -43,6 +76,8 @@ def _resolve(path: str) -> Path:
     """
     root = paths.workspace()
     candidate = (root / path).resolve()
+    if str(candidate) in _approved_paths():
+        return candidate
     try:
         candidate.relative_to(root)
     except ValueError:

@@ -12,6 +12,7 @@ import sys
 import json
 from typing import Callable
 
+from tools import file_tools
 from tools.file_tools import FILE_TOOLS, FILE_TOOL_HANDLERS
 from tools.todo_tool import TODO_TOOLS, TODO_TOOL_HANDLERS, TodoManager
 import paths
@@ -147,6 +148,10 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, inter
     send, deadlocking whatever's waiting on this task via
     DependencyGraph.wait_for_dependencies()."""
     provider = get_provider(model_key)
+    # Start from no grants, whatever happened on this thread before. Clearing
+    # only on the way out would miss a run that raised, and two sequential
+    # run_agent() calls on one thread would share approvals.
+    file_tools.clear_approved_paths()
     approver = approver or (CLIApprover() if interactive else DenyApprover())
     system_prompt = build_system_prompt(model_key)  # model_key is fixed for this run
     todo_manager = TodoManager()  # own instance per run — never shared, no lock needed
@@ -233,6 +238,14 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, inter
                                  "Tell the user what you needed and why."
                     })
                 elif approver.approve(tc.name, args, decision.reason):
+                    # Consent has to actually grant the thing. The file tools
+                    # are workspace-bound in _resolve(), so without this an
+                    # approved out-of-workspace write would still fail — the
+                    # prompt would be asking a question it couldn't honour.
+                    # Covers "always" too: approve() returns True without
+                    # re-asking, and each new path still gets granted here.
+                    if tc.name in permissions.PATH_TOOLS and args.get("path"):
+                        file_tools.allow_path(args["path"])
                     result = execute_tool(tc.name, args, model_key, todo_manager, mem)
                 else:
                     if verbose:
@@ -268,6 +281,10 @@ def run_agent(task: str, verbose: bool = True, model_key: str = MODEL_KEY, inter
         else:
             history.append(Turn(role="user", tool_results=tool_results))
 
+    # Grants are per-run, not per-thread-lifetime: executor threads are created
+    # per batch but nothing guarantees they aren't reused, and a later run must
+    # never inherit approvals a human gave to an earlier one.
+    file_tools.clear_approved_paths()
     return final_text
 
 

@@ -96,7 +96,8 @@ class ScopeScheduler:
 def run_executor_task(scheduler: ScopeScheduler, graph: DependencyGraph, task_id: str,
                        description: str, scope: list[str], external_deps: set[str],
                        mem: memory.Memory, preferred_model: str | None = None,
-                       event_sink: "EventSink | None" = None, injection_queue=None) -> str:
+                       event_sink: "EventSink | None" = None, injection_queue=None,
+                       approver=None, mode: str | None = None) -> str:
     dep_results = graph.wait_for_dependencies(task_id, event_sink=event_sink)
     for d in external_deps:  # earlier-turn deps: already in memory, no waiting needed
         dep_results[d] = mem.read_entry(d)
@@ -110,8 +111,14 @@ def run_executor_task(scheduler: ScopeScheduler, graph: DependencyGraph, task_id
         scheduler.acquire(task_id, scope, event_sink=event_sink)    # can raise TimeoutError — same
         acquired = True
         _emit(event_sink, "task_status_changed", {"task_id": task_id, "status": "running"})
+        # approver is the session's gate, shared by every executor — the one
+        # attached human answers for all of them. Without it these threads get
+        # run_agent's DenyApprover default, which refuses any escalation with
+        # nobody ever asked.
+        kwargs = {"mode": mode} if mode else {}
         result = run_agent(description, verbose=False, model_key=model_key, interactive=False,
-                            task_id=task_id, event_sink=event_sink, mem=mem, injection_queue=injection_queue)
+                            task_id=task_id, event_sink=event_sink, mem=mem,
+                            injection_queue=injection_queue, approver=approver, **kwargs)
     except Exception as e:
         result = f"Executor task failed: {e}"
     finally:
@@ -127,7 +134,8 @@ def run_executor_task(scheduler: ScopeScheduler, graph: DependencyGraph, task_id
 
 
 def execute_delegate_tasks(calls: list, scheduler: ScopeScheduler, event_sink: "EventSink | None" = None,
-                            mem: "memory.Memory | None" = None, injection_queue=None) -> list[ToolResult]:
+                            mem: "memory.Memory | None" = None, injection_queue=None,
+                            approver=None, mode: str | None = None) -> list[ToolResult]:
     """All delegate_task calls from one orchestrator turn, run as a batch of threads.
     mem defaults to memory.default_memory() if not given (standalone use) —
     a real session always passes its own instance so every executor it
@@ -153,7 +161,8 @@ def execute_delegate_tasks(calls: list, scheduler: ScopeScheduler, event_sink: "
     def _run(tc):
         results[tc.id] = run_executor_task(scheduler, graph, tc.id, tc.args["description"], tc.args["scope"],
                                             external[tc.id], mem, tc.args.get("model_key"),
-                                            event_sink=event_sink, injection_queue=injection_queue)
+                                            event_sink=event_sink, injection_queue=injection_queue,
+                                            approver=approver, mode=mode)
 
     threads = [threading.Thread(target=_run, args=(tc,)) for tc in calls]
     for t in threads:

@@ -60,7 +60,8 @@ def execute_orchestrator_tool(name: str, args: dict, model_key: str, todo_manage
 
 def run_orchestrator(task: str, verbose: bool = True, model_key: str | None = None,
                       event_sink: "EventSink | None" = None, mem: "memory.Memory | None" = None,
-                      injection_queue: "InjectionQueue | None" = None) -> str:
+                      injection_queue: "InjectionQueue | None" = None,
+                      approver=None, mode: str | None = None) -> str:
     """task_id=None on emitted events means the orchestrator itself, same
     convention dispatch.py uses for delegated tasks. mem/injection_queue
     default to fresh/standalone instances but are meant to be passed in by
@@ -109,7 +110,12 @@ def run_orchestrator(task: str, verbose: bool = True, model_key: str | None = No
 
         results_by_id: dict[str, ToolResult] = {}
         if delegate_calls:
-            for r in dispatch.execute_delegate_tasks(delegate_calls, scheduler, event_sink=event_sink, mem=mem, injection_queue=injection_queue):
+            # The orchestrator's own tools are all internal (delegate/todo/memory),
+            # so it never needs approval itself — but its executors do, and they
+            # share this session's gate so one human answers for all of them.
+            for r in dispatch.execute_delegate_tasks(delegate_calls, scheduler, event_sink=event_sink,
+                                                      mem=mem, injection_queue=injection_queue,
+                                                      approver=approver, mode=mode):
                 results_by_id[r.call_id] = r
         for tc in other_calls:
             _emit(event_sink, "tool_call", {"task_id": None, "name": tc.name, "args": tc.args})
