@@ -12,6 +12,8 @@ import orchestrator
 import memory
 from config import routing, vault
 from injection import InjectionQueue
+from approval import ApprovalGate
+import permissions
 import paths
 from paths import FOX_HOME
 
@@ -38,10 +40,18 @@ class Session:
     def __init__(self, session_id: str, task: str):
         self.session_id = session_id
         self.state = SessionState(session_id=session_id, task=task)
-        self.clients: set = set()  
-        self.injection_queue = InjectionQueue() 
+        self.clients: set = set()
+        self.injection_queue = InjectionQueue()
         self._lock = threading.Lock()
         self.loop: asyncio.AbstractEventLoop | None = None
+        # Emits through handle_event, so an approval request is persisted and
+        # broadcast like any other event — a client that attaches mid-wait can
+        # replay it from the session log instead of hanging with no context.
+        self.approval_gate = ApprovalGate(emit=self.handle_event)
+        # Set by _start_session. Kept on the session so a side conversation can
+        # share it — that sharing is what "inherits the summary, not the
+        # transcript" means in practice.
+        self.mem: memory.Memory | None = None
 
     def persist(self) -> None:
         path = SESSIONS_DIR / f"{self.session_id}.json"
@@ -85,19 +95,51 @@ SESSIONS: dict[str, Session] = {}
 SESSIONS_LOCK = threading.Lock()
 
 
-def _start_session(task: str, model_key: str | None, mode: str, loop: asyncio.AbstractEventLoop) -> Session:
+def _side_conversation_task(question: str, parent: Session) -> str:
+    """Wrap a side question in what the main thread has established.
+
+    Deliberately not the parent's transcript: that would be resent in full on
+    every turn of the side conversation, which free-tier token budgets can't
+    absorb. The todo list and the memory index are already externalised
+    summaries of the same progress, so they carry the useful part cheaply.
+    The shared Memory instance goes along too, so memory_read can pull a full
+    entry on demand rather than everything being force-fed up front."""
+    parts = ["[Side conversation. The main task is still running — you are not working on it.",
+             "Answer the question; don't continue the main task unless asked.]", ""]
+    with parent._lock:
+        main_task, todos = parent.state.task, parent.state.todos
+    parts.append(f"Main task: {main_task}")
+    if todos:
+        parts.append(f"\nProgress so far:\n{todos}")
+    if parent.mem is not None:
+        index = parent.mem.read_index()
+        if index and index != "(empty)":
+            parts.append(f"\nShared memory index (pull a full entry with memory_read):\n{index}")
+    parts.append(f"\nQuestion: {question}")
+    return "\n".join(parts)
+
+
+def _start_session(task: str, model_key: str | None, mode: str, loop: asyncio.AbstractEventLoop,
+                   permission_mode: str = permissions.WORKSPACE_WRITE,
+                   parent: "Session | None" = None) -> Session:
     """mode="agent" (default) runs a single agent with real bash/file tools —
     a normal coding-harness session, one model, no delegation. mode=
     "orchestrator" is the Phase 5 multi-agent path: plans and delegates,
     never touches files/bash directly itself. Both emit the same event
     shapes, so the rest of Session doesn't need to know which one is running."""
     session_id = str(uuid.uuid4())
+    if parent is not None:
+        task = _side_conversation_task(task, parent)
     session = Session(session_id, task)
     session.loop = loop
     with SESSIONS_LOCK:
         SESSIONS[session_id] = session
 
-    mem = memory.Memory(SESSIONS_DIR / session_id / "SHARED_MEMORY.md")
+    # A side conversation shares its parent's memory log rather than opening a
+    # fresh one, so notes written on either side are visible to both.
+    mem = parent.mem if (parent is not None and parent.mem is not None) \
+        else memory.Memory(SESSIONS_DIR / session_id / "SHARED_MEMORY.md")
+    session.mem = mem
 
     def run():
         try:
@@ -106,15 +148,21 @@ def _start_session(task: str, model_key: str | None, mode: str, loop: asyncio.Ab
                     task, verbose=False, model_key=model_key,
                     event_sink=session.handle_event, mem=mem,
                     injection_queue=session.injection_queue,
+                    approver=session.approval_gate, mode=permission_mode,
                 )
             else:
                 # No routing.pick_orchestrator() strong-tier requirement here —
                 # a single chatting agent works with whatever key is present.
                 chosen_model = model_key or routing.pick_executor()
+                # interactive=False only means "don't prompt on stdin" — the
+                # explicit approver is what actually reaches the human, via the
+                # TUI. Without it this would fall back to DenyApprover and
+                # refuse every escalation with nobody ever asked.
                 final = agent.run_agent(
                     task, verbose=False, model_key=chosen_model, interactive=False,
                     task_id=None, event_sink=session.handle_event, mem=mem,
                     injection_queue=session.injection_queue, keep_alive=True,
+                    approver=session.approval_gate, mode=permission_mode,
                 )
             with session._lock:
                 session.state.final_text = final
@@ -123,6 +171,9 @@ def _start_session(task: str, model_key: str | None, mode: str, loop: asyncio.Ab
             with session._lock:
                 session.state.status = "failed"
                 session.state.final_text = str(e)
+        # Releases any executor thread still parked on an unanswered approval.
+        # Without this they'd hold the process open after the session ended.
+        session.approval_gate.close()
         session.persist()
         session._broadcast("session_ended", {
             "task_id": None, "status": session.state.status, "final_text": session.state.final_text,
@@ -143,17 +194,45 @@ def _validate_all_keys() -> None:
 
 
 async def handler(ws) -> None:
-    attached: Session | None = None
+    # A set, not one session: a client with threads open holds several at
+    # once. Tracking only the latest leaked every earlier one's client
+    # registration on disconnect, so the server kept broadcasting to a
+    # socket that was gone.
+    attached: set[Session] = set()
     async for raw in ws:
         msg = json.loads(raw)
         msg_type = msg.get("type")
 
         if msg_type == "start_session":
+            # "mode" picks the runner (agent vs orchestrator); "permission_mode"
+            # is the separate sandbox axis (read-only / workspace-write /
+            # full-access). Different concepts, unfortunately similar names.
+            permission_mode = msg.get("permission_mode") or permissions.WORKSPACE_WRITE
+            if permission_mode not in permissions.MODES:
+                await ws.send(json.dumps({
+                    "type": "error",
+                    "message": f"unknown permission_mode {permission_mode!r}; expected one of {list(permissions.MODES)}",
+                }))
+                continue
+            # parent_session_id marks this as a side conversation (a "thread"
+            # in the TUI): its own agent and history, but seeded with the
+            # parent's progress and sharing the parent's memory log.
+            parent = None
+            if msg.get("parent_session_id"):
+                with SESSIONS_LOCK:
+                    parent = SESSIONS.get(msg["parent_session_id"])
+                if parent is None:
+                    await ws.send(json.dumps({
+                        "type": "error",
+                        "message": f"unknown parent_session_id {msg['parent_session_id']!r}",
+                    }))
+                    continue
             session = _start_session(
-                msg["task"], msg.get("model_key"), msg.get("mode", "agent"), asyncio.get_running_loop()
+                msg["task"], msg.get("model_key"), msg.get("mode", "agent"),
+                asyncio.get_running_loop(), permission_mode=permission_mode, parent=parent,
             )
             session.clients.add(ws)
-            attached = session
+            attached.add(session)
             await ws.send(json.dumps({"type": "session_started", "session_id": session.session_id}))
 
         elif msg_type == "attach_session":
@@ -163,7 +242,7 @@ async def handler(ws) -> None:
                 await ws.send(json.dumps({"type": "error", "message": f"unknown session_id {msg['session_id']!r}"}))
                 continue
             session.clients.add(ws)
-            attached = session
+            attached.add(session)
             await ws.send(json.dumps({"type": "attached", "session_id": session.session_id, "state": asdict(session.state)}))
 
         elif msg_type == "human_message":
@@ -185,7 +264,27 @@ async def handler(ws) -> None:
                 await ws.send(json.dumps({"type": "error", "message": f"unknown session_id {msg.get('session_id')!r}"}))
                 continue
             session.injection_queue.close(msg.get("task_id"))
+            # Also wake anything parked on an approval. A thread blocked in
+            # approve() never returns to the agent loop, so closing only the
+            # injection queue would leave it waiting forever for an answer
+            # from a user who has just left.
+            session.approval_gate.close()
             await ws.send(json.dumps({"type": "end_session_queued", "session_id": session.session_id}))
+
+        elif msg_type == "approval_response":
+            with SESSIONS_LOCK:
+                session = SESSIONS.get(msg.get("session_id"))
+            if session is None:
+                await ws.send(json.dumps({"type": "error", "message": f"unknown session_id {msg.get('session_id')!r}"}))
+                continue
+            # Non-blocking: respond() only sets the answer and notifies. The
+            # agent thread parked in approve() wakes on its own.
+            session.approval_gate.respond(
+                msg["request_id"],
+                bool(msg.get("approved")),
+                always=bool(msg.get("always")),
+                tool_name=msg.get("tool_name"),
+            )
 
         elif msg_type == "list_models":
             # The vault is process-global, not per-session, so this is
@@ -221,8 +320,8 @@ async def handler(ws) -> None:
         else:
             await ws.send(json.dumps({"type": "error", "message": f"unknown message type {msg_type!r}"}))
 
-    if attached is not None:
-        attached.clients.discard(ws)
+    for session in attached:
+        session.clients.discard(ws)
 
 
 async def main(host: str = "localhost", port: int = 8765) -> None:
