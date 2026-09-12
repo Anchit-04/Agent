@@ -21,30 +21,45 @@ type envelope struct {
 }
 
 type agentTurnMsg struct {
-	TaskID   *string `json:"task_id"`
-	ModelKey string  `json:"model_key"`
-	Text     string  `json:"text"`
+	SessionID string  `json:"session_id"`
+	TaskID    *string `json:"task_id"`
+	ModelKey  string  `json:"model_key"`
+	Text      string  `json:"text"`
 }
 
 type toolCallMsg struct {
-	TaskID *string        `json:"task_id"`
-	Name   string         `json:"name"`
-	Args   map[string]any `json:"args"`
+	SessionID string         `json:"session_id"`
+	TaskID    *string        `json:"task_id"`
+	Name      string         `json:"name"`
+	Args      map[string]any `json:"args"`
 }
 
 type toolResultMsg struct {
-	TaskID  *string `json:"task_id"`
-	Name    string  `json:"name"`
-	Content string  `json:"content"`
+	SessionID string  `json:"session_id"`
+	TaskID    *string `json:"task_id"`
+	Name      string  `json:"name"`
+	Content   string  `json:"content"`
 }
 
 type sessionEndedMsg struct {
+	SessionID string `json:"session_id"`
 	Status    string `json:"status"`
 	FinalText string `json:"final_text"`
 }
 
 type serverErrorMsg struct {
 	Message string `json:"message"`
+}
+
+// approvalRequestedMsg means an agent thread is parked, waiting on an answer.
+// It stays parked until we reply with this RequestID or the session ends —
+// there's no timeout on the server side, deliberately.
+type approvalRequestedMsg struct {
+	SessionID   string `json:"session_id"`
+	RequestID   string `json:"request_id"`
+	ToolName    string `json:"tool_name"`
+	Reason      string `json:"reason"`
+	Description string `json:"description"`
 }
 
 // vaultEntry mirrors config/vault.py's VaultEntry dataclass. Validated is a
@@ -59,6 +74,79 @@ type vaultEntry struct {
 
 type modelsMsg struct {
 	Models []vaultEntry `json:"models"`
+}
+
+// sessionStartedMsg arrives when a thread we opened has its session. The very
+// first one is consumed inside connect() during the handshake, so any that
+// reach listen() belong to a thread started later on the same connection.
+type sessionStartedMsg struct {
+	SessionID string `json:"session_id"`
+}
+
+// startThread opens a side conversation on the connection we already have.
+// parentID seeds it with the parent's progress server-side; the reply comes
+// back asynchronously through listen() as sessionStartedMsg.
+func startThread(conn *websocket.Conn, question, parentID, modelKey string) error {
+	return wsjson.Write(context.Background(), conn, map[string]any{
+		"type": "start_session", "task": question, "model_key": modelKey,
+		"mode": "agent", "parent_session_id": parentID,
+	})
+}
+
+// storedEvent is one entry from a session's persisted log. The server keeps
+// every emitted event in SessionState.turns; on attach it hands the whole list
+// over so a fresh window can rebuild the transcript.
+type storedEvent struct {
+	Type    string         `json:"type"`
+	Payload map[string]any `json:"payload"`
+}
+
+// attachedMsg is the reply to attach_session: the session's state, including
+// its event history.
+type attachedMsg struct {
+	SessionID string `json:"session_id"`
+	State     struct {
+		Task     string        `json:"task"`
+		ModelKey string        `json:"model_key"`
+		Status   string        `json:"status"`
+		Turns    []storedEvent `json:"turns"`
+	} `json:"state"`
+}
+
+// attach joins a session that already exists instead of starting a new one.
+// connect() always sends start_session, so without this every launch created a
+// fresh conversation and a session you closed stayed unreachable for the life
+// of the server.
+func attach(url, sessionID string) (*websocket.Conn, attachedMsg, error) {
+	var reply attachedMsg
+	ctx := context.Background()
+	conn, _, err := websocket.Dial(ctx, url, nil)
+	if err != nil {
+		return nil, reply, fmt.Errorf("dial failed: %w", err)
+	}
+	if err := wsjson.Write(ctx, conn, map[string]any{
+		"type": "attach_session", "session_id": sessionID,
+	}); err != nil {
+		return nil, reply, fmt.Errorf("failed to send attach_session: %w", err)
+	}
+
+	// Nothing else can arrive first: this connection has sent only that one
+	// message, and the server answers it with "attached" or "error".
+	_, data, err := conn.Read(ctx)
+	if err != nil {
+		return nil, reply, fmt.Errorf("failed to read attach reply: %w", err)
+	}
+	var probe struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(data, &probe) == nil && probe.Type == "error" {
+		return nil, reply, fmt.Errorf("%s", probe.Message)
+	}
+	if err := json.Unmarshal(data, &reply); err != nil {
+		return nil, reply, fmt.Errorf("malformed attach reply: %w", err)
+	}
+	return conn, reply, nil
 }
 
 // connectionLostMsg is ours, not the server's — listen() synthesizes it
@@ -132,6 +220,14 @@ func listen(conn *websocket.Conn, p *tea.Program) {
 			var m sessionEndedMsg
 			json.Unmarshal(data, &m)
 			p.Send(m)
+		case "approval_requested":
+			var m approvalRequestedMsg
+			json.Unmarshal(data, &m)
+			p.Send(m)
+		case "session_started":
+			var m sessionStartedMsg
+			json.Unmarshal(data, &m)
+			p.Send(m)
 		case "models":
 			var m modelsMsg
 			json.Unmarshal(data, &m)
@@ -142,6 +238,16 @@ func listen(conn *websocket.Conn, p *tea.Program) {
 			p.Send(m)
 		}
 	}
+}
+
+// sendApprovalResponse answers one pending approval. toolName is only needed
+// when always is set — the server remembers "always" per tool, not per request.
+func sendApprovalResponse(conn *websocket.Conn, sessionID, requestID, toolName string,
+	approved, always bool) error {
+	return wsjson.Write(context.Background(), conn, map[string]any{
+		"type": "approval_response", "session_id": sessionID, "request_id": requestID,
+		"tool_name": toolName, "approved": approved, "always": always,
+	})
 }
 
 // requestModels asks the server for the vault contents. validate=true makes
